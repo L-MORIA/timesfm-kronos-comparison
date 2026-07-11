@@ -95,8 +95,10 @@ def load_kronos():
     tok = KronosTokenizer.from_pretrained(TOKENIZER_PATH)
     model = Kronos.from_pretrained(MODEL_PATH)
 
-    import torch
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # Force CPU mode due to RTX 5060 Ti CUDA incompatibility (sm_120 not supported)
+    device = "cpu"
+    predictor = KronosPredictor(model, tok, device=device, max_context=2048)
+    print("[Kronos] Ready (device=cpu)")
     predictor = KronosPredictor(model, tok, device=device, max_context=2048)
     print(f"[Kronos] Ready (device={device})")
     return predictor
@@ -147,7 +149,9 @@ def load_timesfm():
     config = ForecastConfig(max_context=512, max_horizon=128)
     print("[TimesFM] Compiling...")
     model.compile(config)
-    print("[TimesFM] Ready!")
+    # Force CPU mode due to RTX 5060 Ti CUDA incompatibility (sm_120 not supported)
+    model._device = "cpu"
+    print("[TimesFM] Ready (device=cpu)!")
     return model
 
 
