@@ -98,8 +98,6 @@ def load_kronos():
     # Force CPU mode due to RTX 5060 Ti CUDA incompatibility (sm_120 not supported)
     device = "cpu"
     predictor = KronosPredictor(model, tok, device=device, max_context=2048)
-    print("[Kronos] Ready (device=cpu)")
-    predictor = KronosPredictor(model, tok, device=device, max_context=2048)
     print(f"[Kronos] Ready (device={device})")
     return predictor
 
@@ -149,6 +147,8 @@ def load_timesfm():
     config = ForecastConfig(max_context=512, max_horizon=128)
     print("[TimesFM] Compiling...")
     model.compile(config)
+    # Sanity check: HORIZONS in main() must stay within TimesFM's compiled max_horizon.
+    # If you bump HORIZONS above 128, recompile with a larger max_horizon here.
     # Force CPU mode due to RTX 5060 Ti CUDA incompatibility (sm_120 not supported)
     model._device = "cpu"
     print("[TimesFM] Ready (device=cpu)!")
@@ -194,6 +194,14 @@ def compare_signals(kronos_signal, kronos_chg, timesfm_signal, timesfm_chg):
 def main():
     TICKERS = ["SBERP", "GAZP", "LKOH"]  # Сбер преф, Газпром, Лукойл
     HORIZONS = [30, 60, 90]  # дни прогнозирования
+    # Sanity: 30-day horizon is required for the 30d chart section below.
+    if 30 not in HORIZONS:
+        print("[WARN] HORIZONS does not contain 30 — 30d chart will be skipped (no cache).")
+    # Sanity: TimesFM was compiled with max_horizon=128; do not exceed.
+    assert max(HORIZONS) <= 128, (
+        f"TimesFM max_horizon=128, but HORIZONS={HORIZONS}. "
+        "Recompile TimesFM with a larger max_horizon or shrink HORIZONS."
+    )
 
     print("=" * 80)
     now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M MSK")
@@ -209,6 +217,7 @@ def main():
     timesfm_model = load_timesfm()
 
     all_results = []
+    chart_data = {}  # кэш истории+прогноза (30d) на тикер, чтобы не дублировать запрос/инференс ниже
 
     for ticker in TICKERS:
         print(f"\n{'='*80}")
@@ -254,8 +263,9 @@ def main():
                 kronos_chg = 0
                 kronos_horizon_pred = last_price
 
-            # TimesFM prediction — use actual horizon (model compiled with max_horizon=128)
-            timesfm_horizon = min(horizon, 90)  # model supports up to 128
+            # TimesFM prediction — model is compiled with max_horizon=128, and
+            # HORIZONS never exceeds that, so no extra clamping is needed here.
+            timesfm_horizon = horizon
             print(f"  [TimesFM] Predicting {timesfm_horizon}d ahead...")
             try:
                 timesfm_preds = timesfm_forecast(timesfm_model, values_np, timesfm_horizon)
@@ -266,7 +276,18 @@ def main():
                 timesfm_signal = "ERROR"
                 timesfm_chg = 0
                 timesfm_horizon_pred = last_price
+                timesfm_preds = None
                 print(f"  [TimesFM] ERROR: {e}")
+
+            # Cache the 30d history + TimesFM forecast now so the chart section
+            # below doesn't need to re-fetch MOEX data and re-run the model.
+            if horizon == 30 and timesfm_preds is not None:
+                chart_data[ticker] = {
+                    "df": df,
+                    "last_price": last_price,
+                    "last_date": last_date,
+                    "tf_preds": timesfm_preds,
+                }
 
             # Compare signals
             agreement, confidence = compare_signals(
@@ -361,16 +382,14 @@ def main():
         axes = [axes]
 
     for idx, ticker in enumerate(TICKERS):
-        df = fetch_moex_candles(ticker, days=30)
-        if df is None or len(df) < 50:
+        cached = chart_data.get(ticker)
+        if cached is None:
             continue
 
-        last_price = float(df["close"].iloc[-1])
-        values_np = df["close"].values.astype(np.float32)
-        last_date = df["begin"].iloc[-1]
-
-        # TimesFM 30d forecast
-        tf_preds = timesfm_forecast(timesfm_model, values_np, 30)
+        df = cached["df"]
+        last_price = cached["last_price"]
+        last_date = cached["last_date"]
+        tf_preds = cached["tf_preds"]
 
         ax = axes[idx]
         history_dates = df["begin"]
