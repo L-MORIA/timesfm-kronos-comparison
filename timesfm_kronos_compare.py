@@ -104,8 +104,6 @@ def load_kronos():
 
 def kronos_predict(predictor, df_full, pred_len):
     """Run Kronos prediction. Returns forecast close prices."""
-    import torch
-
     # Prepare timestamps from 'begin' column (datetime) — MUST be Series not DatetimeIndex
     x_ts = pd.Series(df_full["begin"])
     last_ts = df_full["begin"].iloc[-1]
@@ -236,7 +234,6 @@ def main():
         print(f"  Last close: {last_price:.2f} RUB")
 
         # Prepare data for both models
-        df_ohlcv = df[["open", "high", "low", "close", "volume"]].copy()
         values_np = df["close"].values.astype(np.float32)
 
         results_for_ticker = []
