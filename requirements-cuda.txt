@@ -1,11 +1,11 @@
-# timesfm-kronos-comparison dependencies (CUDA)
+# timesfm-kronos-comparison dependencies (CUDA — ONLY for sm_80+ GPUs)
 # Python 3.12; install inside the project's .venv (NOT Hermes global venv):
 #   uv venv .venv --python 3.12
 #   uv pip install -r requirements-cuda.txt
 #
-# NOTE: Requires GPU with compute capability sm_80+ (Ampere: RTX 30xx, A100; Hopper: H100).
-#       RTX 5060 Ti (Blackwell, sm_120) is NOT supported by current stable PyTorch.
-#       For unsupported GPUs, fall back to requirements-cpu.txt.
+# SUPPORTED: Ampere (RTX 30xx, A100, sm_80/86), Hopper (H100, sm_90)
+# NOT SUPPORTED: Blackwell (RTX 50xx, sm_120) — kernel image missing in PyTorch nightly
+# If you have RTX 5060 Ti or newer Blackwell — USE requirements.txt (CPU-only)
 
 requests
 numpy
