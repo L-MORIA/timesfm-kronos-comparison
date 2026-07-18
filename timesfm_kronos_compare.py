@@ -8,6 +8,8 @@
 
 import sys
 import os
+import datetime
+import requests
 
 # Force CPU mode before importing torch (RTX 5060 Ti sm_120 not supported)
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
