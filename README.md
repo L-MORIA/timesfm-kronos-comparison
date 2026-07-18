@@ -6,22 +6,35 @@ AI-ансамбль из двух моделей для прогнозирова
 
 Загружает данные с MOEX ISS API → запускает **TimesFM 2.5** (Google Foundation Model) и **Kronos Mini** (4M params) → сравнивает сигналы BUY/SELL/HOLD на горизонтах 30/60/90 дней.
 
-## Быстрый старт
+## Быстрый старт — выбор варианта
 
+### Вариант А: CUDA (GPU с sm_80+ — Ampere RTX 30xx / A100 / H100 / Hopper)
 ```bash
 # Создать venv (Python 3.12; НЕ использовать Hermes global venv)
 uv venv .venv --python 3.12
 
-# Установить зависимости (использует requirements.txt)
-uv pip install -r requirements.txt
+# Установить зависимости с CUDA (PyTorch cu121)
+uv pip install -r requirements-cuda.txt
 
-# Запустить сравнение
+# Запустить сравнение (автоматически использует GPU)
 python timesfm_kronos_compare.py
 ```
 
-> **CPU-only:** torch ставится без CUDA — RTX 5060 Ti (sm_120) пока не поддерживается
-> текущей сборкой PyTorch, поэтому модели работают на CPU. Это настраивается в
-> `load_kronos()` / `load_timesfm()` принудительным `device="cpu"`.
+### Вариант Б: CPU-only (любой CPU, GPU без CUDA-поддержки, Blackwell RTX 50xx sm_120)
+```bash
+# Создать venv (Python 3.12; НЕ использовать Hermes global venv)
+uv venv .venv --python 3.12
+
+# Установить зависимости CPU-only (PyTorch CPU)
+uv pip install -r requirements-cpu.txt
+
+# Запустить сравнение (принудительно CPU)
+python timesfm_kronos_compare.py
+```
+
+> **Важно:** RTX 5060 Ti (Blackwell, sm_120) **не поддерживается** стабильным PyTorch. Используй CPU-вариант. Если у тебя Ampere (RTX 30xx) или новее с поддержкой — CUDA-вариант даст ускорение в 5-10x.
+
+> **Принудительный CPU:** В `load_kronos()` / `load_timesfm()` стоит `device="cpu"`. Для CUDA запуска поменяй на `device="cuda"`.
 
 ## Результаты
 
@@ -46,7 +59,8 @@ hermes cron run <job_id>
 ```
 timesfm-kronos-comparison/
 ├── timesfm_kronos_compare.py   # основной скрипт
-├── requirements.txt            # минимальный стек (timesfm, torch, einops, ...)
+├── requirements-cpu.txt        # CPU-only стек (torch CPU)
+├── requirements-cuda.txt       # CUDA стек (torch cu121)
 ├── logs/                       # результаты (автоматически)
 │   └── comparison_YYYYMMDD.log
 ├── .gitignore
@@ -85,6 +99,7 @@ timesfm-kronos-comparison/
 
 - Python 3.12+
 - `timesfm` (Google)
-- `torch` (CPU-only из-за RTX 5060 Ti sm_120)
+- `torch` — выбери вариант: CPU-only (`requirements-cpu.txt`) или CUDA (`requirements-cuda.txt`)
+- `einops`, `requests`, `numpy`, `pandas`, `matplotlib`
 - Kronos Mini — локально из `~/kronos-signal/models/`
 - MOEX ISS API (бесплатно, без ключа)

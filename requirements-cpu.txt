@@ -1,0 +1,15 @@
+# timesfm-kronos-comparison dependencies (CPU-only)
+# Python 3.12; install inside the project's .venv (NOT Hermes global venv):
+#   uv venv .venv --python 3.12
+#   uv pip install -r requirements-cpu.txt
+#
+# NOTE: torch is CPU-only here (RTX 5060 Ti sm_120 not supported by current CUDA).
+#       Use requirements-cuda.txt if you have a supported GPU (Ampere/Hopper, sm_80+).
+
+requests
+numpy
+pandas
+matplotlib
+torch --index-url https://download.pytorch.org/whl/cpu
+einops
+timesfm
