@@ -8,8 +8,11 @@
 
 import sys
 import os
-import datetime
-import requests
+
+# Force CPU mode before importing torch (RTX 5060 Ti sm_120 not supported)
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+
+# Ensure local venv takes precedence over Hermes global
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -147,8 +150,6 @@ def load_timesfm():
     model.compile(config)
     # Sanity check: HORIZONS in main() must stay within TimesFM's compiled max_horizon.
     # If you bump HORIZONS above 128, recompile with a larger max_horizon here.
-    # Force CPU mode due to RTX 5060 Ti CUDA incompatibility (sm_120 not supported)
-    model._device = "cpu"
     print("[TimesFM] Ready (device=cpu)!")
     return model
 
