@@ -165,27 +165,27 @@ def timesfm_forecast(model, values, horizon):
 # ── Signal comparison ─────────────────────────────────────────
 
 def compute_signal(pred_price, last_price):
-    """Compute BUY/SELL/HOLD signal."""
+    """Compute BUY/SELL/HOLD signal (returns Russian labels)."""
     chg = (pred_price - last_price) / last_price * 100
     if chg >= 2.0:
-        return "BUY", chg
+        return "ПОКУПКА", chg
     elif chg <= -2.0:
-        return "SELL", chg
+        return "ПРОДАЖА", chg
     else:
-        return "HOLD", chg
+        return "ДЕРЖАТЬ", chg
 
 
 def compare_signals(kronos_signal, kronos_chg, timesfm_signal, timesfm_chg):
-    """Compare two model signals."""
+    """Compare two model signals (returns Russian labels)."""
     if kronos_signal == timesfm_signal:
-        agreement = "CONCORDANT"
-        confidence = "HIGH"
+        agreement = "СОВПАДЕНИЕ"
+        confidence = "ВЫСОКАЯ"
     elif abs(kronos_chg) < 0.5 and abs(timesfm_chg) < 0.5:
-        agreement = "NEUTRAL-MATCH"
-        confidence = "MEDIUM"
+        agreement = "НЕЙТРАЛЬНО"
+        confidence = "СРЕДНЯЯ"
     else:
-        agreement = "CONFLICT"
-        confidence = "LOW"
+        agreement = "РАСХОЖДЕНИЕ"
+        confidence = "НИЗКАЯ"
 
     return agreement, confidence
 
@@ -320,11 +320,11 @@ def main():
     print("=" * 80)
 
     for horizon in HORIZONS:
-        print(f"\n--- {horizon} days forecast ---")
-        header = (f"{'Ticker':<7} {'Last':>9} | "
-                 f"{'Kronos':>12} {'Sig':>5} {'Chg%':>8} | "
-                 f"{'TimesFM':>12} {'Sig':>5} {'Chg%':>8} | "
-                 f"{'Agree':>10}")
+        print(f"\n--- Прогноз на {horizon} дней ---")
+        header = (f"{'Тикер':<7} {'Цена':>9} | "
+                 f"{'Kronos':>12} {'Сигн':>5} {'Изм%':>8} | "
+                 f"{'TimesFM':>12} {'Сигн':>5} {'Изм%':>8} | "
+                 f"{'Согл.':>10}")
         sep = "-" * len(header)
         print(sep)
         print(header)
@@ -361,17 +361,17 @@ def main():
         print(f"  Agreement: {agree} (confidence: {r['confidence']})")
 
         # Combined recommendation
-        if agree == "CONCORDANT":
-            if k_sig == "BUY":
-                print(f"  => COMBINED: BUY — обе модели видят рост >2%")
-            elif k_sig == "SELL":
-                print(f"  => COMBINED: SELL — обе модели видят падение >2%")
+        if agree == "СОВПАДЕНИЕ":
+            if k_sig == "ПОКУПКА":
+                print(f"  => СОВОКУПНЫЙ: ПОКУПКА — обе модели видят рост >2%")
+            elif k_sig == "ПРОДАЖА":
+                print(f"  => СОВОКУПНЫЙ: ПРОДАЖА — обе модели видят падение >2%")
             else:
-                print(f"  => COMBINED: HOLD — обе модели видят боковик")
-        elif agree == "NEUTRAL-MATCH":
-            print(f"  => COMBINED: HOLD — обе модели близки к текущей цене, нет сигнала")
+                print(f"  => СОВОКУПНЫЙ: ДЕРЖАТЬ — обе модели видят боковик")
+        elif agree == "НЕЙТРАЛЬНО":
+            print(f"  => СОВОКУПНЫЙ: ДЕРЖАТЬ — обе модели близки к текущей цене, нет сигнала")
         else:
-            print(f"  => COMBINED: CONFLICT — модели расходятся, ждать подтверждения")
+            print(f"  => СОВОКУПНЫЙ: РАСХОЖДЕНИЕ — модели расходятся, ждать подтверждения")
 
     # ── Save chart (30d only) ──────────────────────────────────
     print(f"\n{'='*80}")
@@ -430,11 +430,11 @@ def main():
         lf.write(f"{'='*80}\n")
         # Write the table and interpretation to log too
         for horizon in HORIZONS:
-            lf.write(f"\n--- {horizon} days forecast ---\n")
-            header = (f"{'Ticker':<7} {'Last':>9} | "
-                     f"{'Kronos':>12} {'Sig':>5} {'Chg%':>8} | "
-                     f"{'TimesFM':>12} {'Sig':>5} {'Chg%':>8} | "
-                     f"{'Agree':>10}")
+            lf.write(f"\n--- Прогноз на {horizon} дней ---\n")
+            header = (f"{'Тикер':<7} {'Цена':>9} | "
+                     f"{'Kronos':>12} {'Сигн':>5} {'Изм%':>8} | "
+                     f"{'TimesFM':>12} {'Сигн':>5} {'Изм%':>8} | "
+                     f"{'Согл.':>10}")
             sep = "-" * len(header)
             lf.write(sep + "\n")
             lf.write(header + "\n")
@@ -467,17 +467,17 @@ def main():
             lf.write(f"  TimesFM:   {r['timesfm_pred']:.2f} RUB ({r['timesfm_chg']:+.2f}%) -> [{t_sig}]\n")
             lf.write(f"  Agreement: {agree} (confidence: {r['confidence']})\n")
 
-            if agree == "CONCORDANT":
-                if k_sig == "BUY":
-                    lf.write(f"  => COMBINED: BUY — обе модели видят рост >2%\n")
-                elif k_sig == "SELL":
-                    lf.write(f"  => COMBINED: SELL — обе модели видят падение >2%\n")
+            if agree == "СОВПАДЕНИЕ":
+                if k_sig == "ПОКУПКА":
+                    lf.write(f"  => СОВОКУПНЫЙ: ПОКУПКА — обе модели видят рост >2%\n")
+                elif k_sig == "ПРОДАЖА":
+                    lf.write(f"  => СОВОКУПНЫЙ: ПРОДАЖА — обе модели видят падение >2%\n")
                 else:
-                    lf.write(f"  => COMBINED: HOLD — обе модели видят боковик\n")
-            elif agree == "NEUTRAL-MATCH":
-                lf.write(f"  => COMBINED: HOLD — обе модели близки к текущей цене, нет сигнала\n")
+                    lf.write(f"  => СОВОКУПНЫЙ: ДЕРЖАТЬ — обе модели видят боковик\n")
+            elif agree == "НЕЙТРАЛЬНО":
+                lf.write(f"  => СОВОКУПНЫЙ: ДЕРЖАТЬ — обе модели близки к текущей цене, нет сигнала\n")
             else:
-                lf.write(f"  => COMBINED: CONFLICT — модели расходятся, ждать подтверждения\n")
+                lf.write(f"  => СОВОКУПНЫЙ: РАСХОЖДЕНИЕ — модели расходятся, ждать подтверждения\n")
 
         lf.write(f"\n{'='*80}\n")
         lf.write("DONE\n")
