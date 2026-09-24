@@ -14,12 +14,26 @@ import requests
 # Force CPU mode before importing torch (RTX 5060 Ti sm_120 not supported)
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 
+# Fix SIGSEGV in Kronos decode_s1() on CPU PyTorch builds (sm_120 not supported).
+# PyTorch >2.x with OMP/MKL threads > 1 races during the long autoregressive
+# loop (pred_len=500 → decode_s1/decode_s2 every step). Single-threaded mode
+# is stable; per-step latency is unaffected because attention on CPU is
+# single-thread-friendly, but wall-clock is ~5-10x slower than 6-thread default.
+# Setting these env vars BEFORE importing numpy/torch ensures OMP runtime sees
+# them on first pool allocation; torch.set_num_threads below is the runtime cap.
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+
 # Ensure local venv takes precedence over Hermes global
 import numpy as np
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import torch
+torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
+
 
 # ── MOEX ISS API (как в Kronos) ────────────────────────────────
 MOEX_BASE = "https://iss.moex.com/iss/engines/stock/markets/shares"
@@ -145,7 +159,12 @@ def load_timesfm():
     from timesfm.configs import ForecastConfig
 
     print("[TimesFM] Loading model...")
-    model = tftorch.TimesFM_2p5_200M_torch.from_pretrained("google/timesfm-2.5-200m-pytorch")
+    # Фикс 2026-09-08: строго офлайн — HF геоблок 403, онлайн fallback запрещён (b23 env HF_HUB_OFFLINE=1)
+    try:
+        model = tftorch.TimesFM_2p5_200M_torch.from_pretrained("google/timesfm-2.5-200m-pytorch", local_files_only=True)
+    except Exception as e:
+        print(f"[TimesFM] local cache missing — пропуск прогноза (offline only): {e}")
+        raise RuntimeError(f"TimesFM кэш отсутствует offline: {e} — пропустите прогон, не пробуйте онлайн (HF 403)") from e
 
     config = ForecastConfig(max_context=512, max_horizon=128)
     print("[TimesFM] Compiling...")
@@ -245,19 +264,28 @@ def main():
             print(f"\n  --- Horizon: {horizon} days ---")
 
             # Kronos prediction (convert days to hours)
-            # NOTE: Kronos is autoregressive — accuracy drops after ~20 days (500h)
-            kronos_hours = min(horizon * 24, 500)
-            kronos_limit_warning = horizon > 20
-            print(f"  [Kronos] Predicting {kronos_hours}h ahead...")
+            # NOTE: Kronos is autoregressive — accuracy drops after ~20 days (500h cap).
+            # For 60/90d horizons the cap still bites — Kronos only reaches ~21d in
+            # practice. We surface that explicitly so the comparison is honest.
+            KRONOS_MAX_HOURS = 500
+            kronos_hours = min(horizon * 24, KRONOS_MAX_HOURS)
+            kronos_effective_days = kronos_hours // 24
+            kronos_limit_warning = horizon > 21
+            print(f"  [Kronos] Predicting {kronos_hours}h ahead "
+                  f"(requested {horizon}d → Kronos effective horizon ≈ {kronos_effective_days}d)...")
             if kronos_limit_warning:
-                print(f"    ⚠ Kronos autoregressive limit: accuracy drops after ~20 days")
+                print(f"    ⚠ Kronos autoregressive cap=500h (~21d): "
+                      f"{horizon}d requested, only first ≈{kronos_effective_days}d are meaningful")
             kronos_preds = kronos_predict(kronos_predictor, df, kronos_hours)
 
             if kronos_preds is not None:
                 # Take last prediction as horizon endpoint
                 kronos_horizon_pred = kronos_preds[-1]
                 kronos_signal, kronos_chg = compute_signal(kronos_horizon_pred, last_price)
-                print(f"  [Kronos] {horizon}d forecast: {kronos_horizon_pred:.2f} ({kronos_chg:+.2f}%) -> [{kronos_signal}]")
+                kronos_label = (f"{kronos_effective_days}d (cap)" if horizon > 21
+                                else f"{horizon}d")
+                print(f"  [Kronos] {kronos_label} forecast: "
+                      f"{kronos_horizon_pred:.2f} ({kronos_chg:+.2f}%) -> [{kronos_signal}]")
             else:
                 kronos_signal = "ERROR"
                 kronos_chg = 0
@@ -418,7 +446,6 @@ def main():
     print(f"Chart saved: {out_path}")
 
     # ── Save results to log file ───────────────────────────────
-    import os
     LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
     os.makedirs(LOG_DIR, exist_ok=True)
     log_path = os.path.join(LOG_DIR, f"comparison_{datetime.date.today().strftime('%Y%m%d')}.log")

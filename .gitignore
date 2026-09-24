@@ -18,3 +18,9 @@ logs/
 Thumbs.db
 # Temporary diagnostic scripts
 check_*.py
+# PowerShell artifact — `> nul` redirection accidentally creates a literal file
+# named "nul" on Windows (even though "nul" is reserved). Ignore it.
+nul
+
+# Bash wrapper for cron / manual runs (sibling scripts in the Hermes-agent flow)
+run_*.sh

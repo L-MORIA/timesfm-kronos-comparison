@@ -59,10 +59,13 @@ hermes cron run <job_id>
 ```
 timesfm-kronos-comparison/
 ├── timesfm_kronos_compare.py   # основной скрипт
+├── run_with_sig.sh             # bash-обёртка для cron / ручного запуска
+├── run_debug.py                # faulthandler + single-thread wrapper (диагностика segfault)
 ├── requirements-cpu.txt        # CPU-only стек (torch CPU)
 ├── requirements-cuda.txt       # CUDA стек (torch cu121)
 ├── logs/                       # результаты (автоматически)
-│   └── comparison_YYYYMMDD.log
+│   ├── comparison_YYYYMMDD.log
+│   └── run_YYYYMMDD_*.txt      # последние запуски + debug
 ├── .gitignore
 └── README.md
 ```
@@ -70,6 +73,63 @@ timesfm-kronos-comparison/
 > Kronos Mini загружается из соседнего проекта `~/kronos-signal/`
 > (модели лежат в `~/kronos-signal/models/Kronos-mini/` и
 > `~/kronos-signal/models/Kronos-Tokenizer-2k/`). См. `load_kronos()`.
+
+## Известные особенности
+
+### SIGSEGV в Kronos autoregressive loop на CPU
+
+**Симптом:** Python-процесс убивается `SIGSEGV` без исключения внутри
+`Kronos.model.decode_s1()` при длинном авторегрессивном цикле
+(`pred_len=500`, 500 forward-проходов через attention layers).
+У `faulthandler` обычно не успевает напечатать трейс — это нативный краш,
+не Python-исключение.
+
+**Корень:** гонка в OMP-потоках PyTorch CPU-сборки на Windows при
+`torch.get_num_threads() > 1` (по умолчанию `==6` на i5-3337U).
+
+**Фикс (уже вшит в скрипт):**
+
+```python
+# в начале timesfm_kronos_compare.py
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+import torch
+torch.set_num_threads(1)
+```
+
+Однопоточный режим устраняет краш. Wall-clock вырастает в ~5-10× на длинных
+шагах, но общее время остаётся разумным (~10-15 минут на полный прогон).
+
+Альтернатива через окружение (если `timesfm_kronos_compare.py` править
+нельзя, например в cronjob):
+
+```bash
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python timesfm_kronos_compare.py
+```
+
+Диагностика — `run_debug.py`: включает `faulthandler.enable()` ДО импорта
+torch и `torch.set_num_threads(1)`. Используй, если SIGSEGV вернётся и
+нужен трейс:
+
+```bash
+python run_debug.py
+```
+
+### Семантический cap горизонта Kronos
+
+Kronos — авторегрессия, качество резко падает после ≈20 дней (500 часов).
+В скрипте `kronos_hours = min(horizon * 24, 500)`, поэтому:
+
+| `HORIZONS` | Kronos реально | TimesFM реально |
+|------------|----------------|-----------------|
+| 30         | ≈21d (cap)     | 30d             |
+| 60         | ≈21d (cap) ⚠   | 60d             |
+| 90         | ≈21d (cap) ⚠   | 90d             |
+
+Для `horizon > 21` Kronos-сигнал помечается как «cap» и в выводе видно
+предупреждение. Если важна точность на 60/90d — уменьши `HORIZONS` до
+`[30]` или прими результат Kronos для этих горизонтов как «Kronos не
+покрывает, см. только TimesFM».
 
 ## Модели
 
