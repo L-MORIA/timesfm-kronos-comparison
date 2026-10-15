@@ -18,6 +18,7 @@ logs/
 Thumbs.db
 # Temporary diagnostic scripts
 check_*.py
+stage_check.py
 # PowerShell artifact — `> nul` redirection accidentally creates a literal file
 # named "nul" on Windows (even though "nul" is reserved). Ignore it.
 nul
