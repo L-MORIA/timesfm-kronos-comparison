@@ -113,6 +113,19 @@ def test_dates(df: pd.DataFrame, step: int, horizons: list[int]):
     return out
 
 
+def save_rows(rows: list[dict], path: str) -> None:
+    """Инкрементально дописать наблюдения в CSV.
+
+    Первый прогон писал CSV только в самом конце. Фоновая задача имеет
+    жёсткий лимит 3600 с, и прогон на шаге 10 (~3 ч) был убит по таймауту
+    уже после того, как SBERP отработал целиком — 435 наблюдений пропали.
+    Теперь состояние на диске после каждой точки.
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    df = pd.DataFrame(rows)
+    df.to_csv(path, index=False, encoding="utf-8")
+
+
 def run(args):
     import torch
 
@@ -128,13 +141,25 @@ def run(args):
     print(f"  seed             : {m.SEED}")
     print()
 
+    rows = []
+    done_keys = set()
+    if args.resume and os.path.isfile(OUT_CSV):
+        prev = pd.read_csv(OUT_CSV)
+        rows = prev.to_dict("records")
+        done_keys = {(r["ticker"], str(r["date"]), int(r["horizon"])) for r in rows}
+        print(f"[RESUME] загружено {len(rows)} наблюдений, "
+              f"пропускаем уже посчитанные (ticker, date, horizon)")
+    else:
+        if os.path.isfile(OUT_CSV):
+            os.remove(OUT_CSV)
+    print()
+
     print("[INIT] Загрузка моделей (один раз на весь прогон)...")
     t0 = time.time()
     kp = m.load_kronos()
     tf = m.load_timesfm()
     print(f"[INIT] готово за {time.time() - t0:.1f} с\n")
 
-    rows = []
     t_start = time.time()
 
     for ticker in args.tickers:
@@ -153,9 +178,17 @@ def run(args):
         idxs = test_dates(df, args.step, horizons)
         idxs = [i for i in idxs if df["begin"].iloc[i] >= pd.Timestamp(FROM_DATE)]
         idxs = [i for i in idxs if not excluded(df["begin"].iloc[i])]
+        n_all = len(idxs)
+        idxs = [i for i in idxs
+                if not all((ticker, str(df["begin"].iloc[i].date()), h) in done_keys
+                           for h in horizons)]
         print(f"  баров в выборке : {len(df)}  ({df['begin'].iloc[0].date()} …)")
-        print(f"  тестовых дат    : {len(idxs)}")
+        print(f"  тестовых дат    : {len(idxs)}"
+              + (f" (из {n_all}, часть уже посчитана)" if len(idxs) != n_all else ""))
         print()
+        if not idxs:
+            print("  все точки уже посчитаны — пропускаем тикер\n")
+            continue
 
         t_t = time.time()
         for n_done, i in enumerate(idxs, 1):
@@ -199,6 +232,10 @@ def run(args):
                     "momentum_20_ret": (last / mom_ref - 1) * 100,
                     "realized_ret": realized,
                 })
+
+            # Пишем на диск после каждой точки: фоновый лимит 3600 с может
+            # оборвать прогон в любой момент.
+            save_rows(rows, OUT_CSV)
 
             if n_done % args.progress_every == 0 or n_done == len(idxs):
                 el = time.time() - t_t
@@ -288,13 +325,16 @@ def main():
     ap.add_argument("--tickers", type=str, nargs="+", default=["SBERP", "GAZP", "LKOH"])
     ap.add_argument("--quick", action="store_true",
                     help="быстрая проверка: крупный шаг, один горизонт")
-    ap.add_argument("--progress-every", type=int, default=20)
+    ap.add_argument("--resume", action="store_true",
+                    help="дописать к существующему CSV, пропуская посчитанное")
+    ap.add_argument("--progress-every", type=int, default=25)
     ap.add_argument("--summary-only", action="store_true",
                     help="не прогонять, только пересчитать по сохранённому CSV")
     args = ap.parse_args()
     if args.quick:
         args.step = 40
         args.horizons = [30]
+        args.resume = False
 
     if args.summary_only:
         summarize(pd.read_csv(OUT_CSV))
