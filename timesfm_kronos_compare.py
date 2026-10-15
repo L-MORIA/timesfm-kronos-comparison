@@ -87,6 +87,14 @@ MOEX_PAGE_LIMIT = 500         # максимум MOEX ISS на страницу
 MOEX_MAX_PAGES = 20           # страховка от бесконечной пагинации
 MOEX_ATTEMPTS = 3             # ретраи при сетевых ошибках (audit H5)
 
+# MOEX ISS отдаёт свечу текущего торгового дня, даже когда день ещё не
+# закрыт. В 11:00 это ~2 часа торгов: close = 286.38 вместо итогового.
+# Такой бар искажает всё — last_price, sigma_дневн (частичный возврат),
+# окно Kronos и ось графика — плюс делает прогоны одного дня несравнимыми
+# между собой. Единая торговая сессия MOEX заканчивается в 23:50 MSK,
+# поэтому дневной бар считаем закрытым только после этого времени.
+MOEX_SESSION_END_MIN = 23 * 60 + 50  # 23:50 MSK
+
 # Как считаем сигнал. Порог ±2% был привязан к уровню цены и не учитывал
 # ни волатильность, ни горизонт: на LKOH, выросшем на +26.5% за окно,
 # Kronos давал −25.7% и автоматически попадал в ПРОДАЖА (audit, часть 3).
@@ -208,7 +216,33 @@ def fetch_moex_candles(ticker, days=HISTORY_DAYS):
             .sort_values("begin")
             .reset_index(drop=True))
     df = df[df["close"] > 0].reset_index(drop=True)
+    # Сегодняшний бар может быть незакрытым — отбрасываем (audit, часть 5)
+    df, dropped = drop_incomplete_daily(df)
+    if dropped:
+        print(f"  [{ticker}] отброшен незакрытый бар текущего дня — "
+              f"последнее закрытие = предыдущая сессия")
     return df
+
+
+def drop_incomplete_daily(df, now=None):
+    """Отбросить бар текущего дня, если торги ещё не завершились.
+
+    MOEX отдаёт дневную свечу сегодняшнего дня в любой момент времени. До
+    закрытия сессии её close — это не итоговая цена, а текущая рыночная.
+    Использовать её как последнее закрытие нельзя: от этого зависят
+    last_price, sigma_дневн, окно Kronos, база z и ось графика.
+
+    Возвращает (df, dropped_bool).
+    """
+    if df is None or df.empty:
+        return df, False
+    now = now or datetime.datetime.now(tz=ZoneInfo("Europe/Moscow"))
+    minutes_now = now.hour * 60 + now.minute
+    if minutes_now >= MOEX_SESSION_END_MIN:
+        return df, False  # сессия завершена — сегодняшний бар финальный
+    if df["begin"].iloc[-1].date() != now.date():
+        return df, False  # последний бар — уже закрытый предыдущий день
+    return df.iloc[:-1].reset_index(drop=True), True
 
 
 # ── Kronos Mini (из проекта kronos-signal) ─────────────────────

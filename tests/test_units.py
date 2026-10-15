@@ -112,6 +112,35 @@ check("7 дней: включает сб", any(d.weekday() == 5 for d in seven),
 check("7 дней: 90 баров = 90 дней",
       (m.future_bars(fri, 90, True).iloc[-1] - fri).days, 90)
 
+print("=== drop_incomplete_daily: незакрытый бар (audit часть 5) ===")
+from datetime import datetime as _dt
+from zoneinfo import ZoneInfo as _ZoneInfo
+_msk = _ZoneInfo("Europe/Moscow")
+
+# Бары 11..15 октября, последний = сегодняшний
+_idx = pd.date_range("2026-10-11", periods=5, freq="D")
+_df = pd.DataFrame({"begin": _idx, "close": [100.0] * 5})
+
+_out, _dropped = m.drop_incomplete_daily(
+    _df, now=_dt(2026, 10, 15, 11, 0, tzinfo=_msk))
+check("11:00 сегодня: бар отброшен", _dropped, True)
+check("осталось 4 бара", len(_out), 4)
+check("последний бар = предыдущая сессия",
+      str(_out["begin"].iloc[-1].date()), "2026-10-14")
+
+_out2, _d2 = m.drop_incomplete_daily(
+    _df, now=_dt(2026, 10, 15, 23, 55, tzinfo=_msk))
+check("23:55 после закрытия: бар НЕ отброшен", _d2, False)
+check("осталось 5 баров", len(_out2), 5)
+
+_out3, _d3 = m.drop_incomplete_daily(
+    _df, now=_dt(2026, 10, 16, 11, 0, tzinfo=_msk))
+check("последний бар вчерашний: не отброшен", _d3, False)
+
+_empty = pd.DataFrame({"begin": [], "close": []})
+_out4, _d4 = m.drop_incomplete_daily(_empty, now=_dt(2026, 10, 15, 11, 0, tzinfo=_msk))
+check("пустой df не падает", _d4, False)
+
 print("=== формат: None не выдаётся за прогноз ===")
 check("_num(None)", m._num(None, ">9.2f"), "—")
 check("_num(float)", m._num(287.04, ">9.2f").strip(), "287.04")
