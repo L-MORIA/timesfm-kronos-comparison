@@ -6,7 +6,11 @@ __pycache__/
 venv/
 
 # Logs (gitignored, but created at runtime)
-logs/
+# Именно logs/* , а не logs/ : при исключении каталога целиком git не заходит
+# внутрь и не может re-include отдельный файл. README с контрактом формата
+# логов версионируется — по нему отличаются записи до и после 2026-10-14.
+logs/*
+!logs/README.md
 
 # Images
 *.png

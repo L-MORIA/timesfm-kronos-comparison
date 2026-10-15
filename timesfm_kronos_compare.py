@@ -19,6 +19,7 @@ kronos_hours=min(horizon*24, 500) выдавал одну и ту же 500-ша�
 """
 
 import datetime
+import logging
 import os
 import sys
 import time
@@ -54,6 +55,54 @@ import torch
 # different rollout every time. Seeded once per run in main().
 SEED = 20261014
 
+LOG = logging.getLogger("timesfm_kronos_compare")
+
+# Причина, по которой torch отказался пинтить inter-op пул. Заполняется на
+# этапе импорта (до конфигурации логгера), поэтому само сообщение уходит в
+# run-лог позже, из _setup_logging().
+_THREAD_PIN_NOTE = None
+
+
+def _setup_logging():
+    """Подключить обработчики логирования.
+
+    stdout — Обязательно именно stdout, а не stderr по умолчанию: cron-обёртка
+    (profiles/old-laptop/scripts/timesfm-kronos-compare.py:62) читает
+    proc.stdout и доставляет его в чат дословно, а от stderr берёт только
+    последние 1500 символов (там же стр. 76). Уход сообщений в stderr тихо
+    обрезал бы отчёт в доставке. Формат stdout — «%(message)s», без
+    timestamps и уровней: этот поток читает человек в чате.
+
+    Формат файла полный: timestamp, уровень, имя логгера — там нужен разбор
+    после падения.
+    """
+    logs_dir = os.path.join(SCRIPT_DIR, "logs")
+    os.makedirs(logs_dir, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_path = os.path.join(logs_dir, f"run_{stamp}.log")
+
+    LOG.setLevel(logging.DEBUG)
+    LOG.handlers.clear()  # иначе повторный вызов в одном процессе дублирует вывод
+    LOG.propagate = False  # записи не должны утекать в root-логгер
+
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.setLevel(logging.INFO)
+    stdout_handler.setFormatter(logging.Formatter("%(message)s"))
+    LOG.addHandler(stdout_handler)
+
+    file_handler = logging.FileHandler(run_path, encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)-7s %(name)s: %(message)s"))
+    LOG.addHandler(file_handler)
+
+    if _THREAD_PIN_NOTE:
+        # Сообщение уровня DEBUG, произошедшее до конфигурации, иначе потерялось бы.
+        LOG.debug("torch отклонил set_num_interop_threads(1) при импорте: %s",
+                  _THREAD_PIN_NOTE)
+    LOG.info("run-log: %s", run_path)
+    return run_path
+
 
 def _pin_threads():
     """Ограничить intra/inter-op пул потоков до 1.
@@ -61,12 +110,20 @@ def _pin_threads():
     set_num_interop_threads() можно вызвать только один раз за процесс —
     повторный вызов бросает RuntimeError. Это ломало run_debug.py, который
     уже пинит потоки до импорта основного скрипта (audit H1).
+
+    RuntimeError здесь означает два противоположных случая, и молчать обоих
+    нельзя:
+      1) пул уже создан в этом процессе (run_debug.py) — ожидаемо и безобидно;
+      2) «parallel work has started» — гарантия single-thread НЕ сработала,
+         то есть ровно тот класс SIGSEGV, ради которого файл и пиннит потоки.
+    Текст исключения сохраняется и уходит в run-лог на уровне DEBUG.
     """
+    global _THREAD_PIN_NOTE
     torch.set_num_threads(1)
     try:
         torch.set_num_interop_threads(1)
-    except RuntimeError:
-        pass  # уже установлено ранее в этом процессе (run_debug.py)
+    except RuntimeError as e:
+        _THREAD_PIN_NOTE = str(e)
 
 
 _pin_threads()
@@ -130,6 +187,13 @@ MOEX_BASE = "https://iss.moex.com/iss/engines/stock/markets/shares"
 
 
 def moex_url(ticker):
+    """URL дневных свечей MOEX ISS для бумаги на BOARD.
+
+    Контракт жёсткий: BOARD («TQBR») зашит в путь, и при смене площадки MOEX
+    этот endpoint начинает отдавать 404 без внятного сообщения — _moex_json()
+    съест это в ретраях и вернёт None, и тикер молча выпадет из отчёта.
+    Проверять здесь надо и BOARD, и то, что бумага вообще на нём торгуется.
+    """
     return f"{MOEX_BASE}/boards/{BOARD}/securities/{ticker}/candles.json"
 
 
@@ -145,7 +209,8 @@ def _moex_json(url, params, ticker):
             last_err = e
             if attempt + 1 < MOEX_ATTEMPTS:
                 time.sleep(2 ** attempt)
-    print(f"  [{ticker}] MOEX ISS недоступен после {MOEX_ATTEMPTS} попыток: {last_err}")
+    LOG.warning("  [%s] MOEX ISS недоступен после %d попыток: %s",
+                ticker, MOEX_ATTEMPTS, last_err)
     return None
 
 
@@ -186,7 +251,8 @@ def fetch_moex_candles(ticker, days=HISTORY_DAYS):
     else:
         # audit M4: без этой границы цикл не завершился бы, если бы MOEX
         # проигнорировал offset `start` и отдавал одну и ту же страницу.
-        print(f"  [{ticker}] пагинация остановлена на MOEX_MAX_PAGES={MOEX_MAX_PAGES}")
+        LOG.warning("  [%s] пагинация остановлена на MOEX_MAX_PAGES=%d",
+                    ticker, MOEX_MAX_PAGES)
 
     if not rows or not cols:
         return None
@@ -213,7 +279,7 @@ def normalize_candles(df, ticker=None):
     missing = [c for c in ("open", "high", "low", "close", "volume", "value", "begin")
                if c not in df.columns]
     if missing:
-        print(f"  [{ticker}] неожиданная схема MOEX, нет колонок: {missing}")
+        LOG.error("  [%s] неожиданная схема MOEX, нет колонок: %s", ticker, missing)
         return None
 
     df = df.rename(columns={"value": "amount"})
@@ -229,8 +295,8 @@ def normalize_candles(df, ticker=None):
 
     df, dropped = drop_incomplete_daily(df)
     if dropped and ticker:
-        print(f"  [{ticker}] отброшен незакрытый бар текущего дня — "
-              f"последнее закрытие = предыдущая сессия")
+        LOG.info("  [%s] отброшен незакрытый бар текущего дня — "
+                 "последнее закрытие = предыдущая сессия", ticker)
     return df
 
 
@@ -270,14 +336,14 @@ def load_kronos():
     MODEL_PATH = os.path.join(KRONOS_PROJECT, "models", "Kronos-mini")
     TOKENIZER_PATH = os.path.join(KRONOS_PROJECT, "models", "Kronos-Tokenizer-2k")
 
-    print("[Kronos] Loading model...")
+    LOG.info("[Kronos] Loading model...")
     tok = KronosTokenizer.from_pretrained(TOKENIZER_PATH)
     model = Kronos.from_pretrained(MODEL_PATH)
 
     # Force CPU mode due to RTX 5060 Ti CUDA incompatibility (sm_120 not supported)
     device = "cpu"
     predictor = KronosPredictor(model, tok, device=device, max_context=2048)
-    print(f"[Kronos] Ready (device={device})")
+    LOG.info("[Kronos] Ready (device=%s)", device)
     return predictor
 
 
@@ -330,8 +396,10 @@ def kronos_predict(predictor, df_full, pred_len, trades_weekends):
         )
         return pred_df["close"].values
     except Exception as e:
-        print(f"  [Kronos] ERROR: {e}")
-        import traceback; traceback.print_exc()
+        LOG.error("  [Kronos] ERROR: %s", e)
+        # Полный трейс — только в run-лог: stdout уходит в чат дословно,
+        # и стек-трейс там занимал бы больше места, чем сам отчёт.
+        LOG.debug("  [Kronos] traceback:", exc_info=True)
         return None
 
 
@@ -342,21 +410,22 @@ def load_timesfm():
     from timesfm.timesfm_2p5 import timesfm_2p5_torch as tftorch
     from timesfm.configs import ForecastConfig
 
-    print("[TimesFM] Loading model...")
+    LOG.info("[TimesFM] Loading model...")
     # Фикс 2026-09-08: строго офлайн — HF геоблок 403, онлайн fallback запрещён
     try:
         model = tftorch.TimesFM_2p5_200M_torch.from_pretrained(
             "google/timesfm-2.5-200m-pytorch", local_files_only=True)
     except Exception as e:
-        print(f"[TimesFM] local cache missing — пропуск прогноза (offline only): {e}")
+        LOG.error("[TimesFM] local cache missing — пропуск прогноза "
+                  "(offline only): %s", e)
         raise RuntimeError(
             f"TimesFM кэш отсутствует offline: {e} — пропустите прогон, "
             f"не пробуйте онлайн (HF 403)") from e
 
     config = ForecastConfig(max_context=512, max_horizon=TIMESFM_MAX_HORIZON)
-    print("[TimesFM] Compiling...")
+    LOG.info("[TimesFM] Compiling...")
     model.compile(config)
-    print("[TimesFM] Ready (device=cpu)!")
+    LOG.info("[TimesFM] Ready (device=cpu)!")
     return model
 
 
@@ -455,6 +524,13 @@ def _num(value, spec):
 
 
 def render_table(results, horizon):
+    """Таблица сравнения по одному горизонту. Возвращает готовый текст.
+
+    Единственный источник строк таблицы: их используют и вывод в чат, и
+    отчёт comparison_*.log. Копия таблицы в двух местах — это и был audit
+    M-дрейф (расъехавшаяся ширина колонок), поэтому дублировать разметку
+    здесь нельзя.
+    """
     rows = [r for r in results if r["horizon"] == horizon]
     sep = "-" * len(_TABLE_HEADER)
     lines = [sep, _TABLE_HEADER, sep]
@@ -476,6 +552,13 @@ def render_table(results, horizon):
 
 
 def render_interpretation(results, horizon=30):
+    """Текстовые вердикты по одному горизонту. Возвращает готовый текст.
+
+    Источник строк интерпретации для обоих каналов вывода — как и
+    render_table(), копия здесь означала бы расхождение отчёта с чатом.
+    Рендерится только HORIZONS[0]: на 60 и 90 днях вердикт повторяет тот же
+    текст, различаясь лишь числом в заголовке.
+    """
     rows = [r for r in results if r["horizon"] == horizon]
     if not rows:
         return f"(нет данных за {horizon} дней)"
@@ -518,6 +601,15 @@ def render_diagnostics(results):
 
 
 def _recommendation(agreement, kronos_signal):
+    """Сводный вердикт по строке таблицы.
+
+    Здесь живёт бизнес-правило, которое нельзя потерять при правках: две
+    модели, обе сказавшие «ДЕРЖАТЬ», дают согласие низкой ставки —
+    «НЕЙТРАЛЬНО/СРЕДНЯЯ», а не «СОВПАДЕНИЕ/ВЫСОКАЯ». Иначе две модели,
+    которые ничего не предсказали, читались бы как уверенный сигнал
+    (это тот же класс ошибки, что C4/C5). Добавляя ветку, проверь, что
+    она не относится к случаю «обе модели бездействуют».
+    """
     if agreement == NO_DATA:
         return "СОВОКУПНЫЙ: НЕТ ДАННЫХ — прогноз одной из моделей недоступен"
     if agreement == "СОВПАДЕНИЕ":
@@ -531,181 +623,178 @@ def _recommendation(agreement, kronos_signal):
 
 
 # ── Main pipeline ─────────────────────────────────────────────
+# Фазы разделены по стоимости и по способу отказа, а не по числу строк:
+# загрузка моделей (самая долгая, своя точка отказа), сбор данных, прогноз
+# по горизонтам, вывод. Отчёт вынесен отдельно — у него свой контракт формата.
 
-def main():
-    now_str = datetime.datetime.now(tz=ZoneInfo("Europe/Moscow")).strftime("%Y-%m-%d %H:%M MSK")
-    print("=" * 80)
-    print("  TIMESFM 2.5 + KRONOS MINI — COMPARISON")
-    print(f"  {now_str}")
-    print(f"  units: daily bars (interval={INTERVAL}), "
-          f"horizons={HORIZONS} days, seeds={SEED}")
-    print(f"  signal mode: {SIGNAL_MODE} (порог ±{Z_THRESHOLD:.0f}σ "
-          f"h-шаговой диффузии)")
-    print("=" * 80)
 
-    torch.manual_seed(SEED)  # см. SEED
+def _banner(now_str):
+    """Шапка прогона. Те же строки дублируются в отчёт (см. _write_report)."""
+    LOG.info("=" * 80)
+    LOG.info("  TIMESFM 2.5 + KRONOS MINI — COMPARISON")
+    LOG.info("  %s", now_str)
+    LOG.info("  units: daily bars (interval=%d), horizons=%s days, seeds=%d",
+             INTERVAL, HORIZONS, SEED)
+    LOG.info("  signal mode: %s (порог ±%.0fσ h-шаговой диффузии)",
+             SIGNAL_MODE, Z_THRESHOLD)
+    LOG.info("=" * 80)
 
-    print("\n[INIT] Loading Kronos-mini...")
-    kronos_predictor = load_kronos()
 
-    print("\n[INIT] Loading TimesFM 2.5...")
-    timesfm_model = load_timesfm()
+def _fetch_ticker(ticker):
+    """Скачать бары MOEX. None — тикер пропущен, у него не будет строк."""
+    LOG.info("\n%s", "=" * 80)
+    LOG.info("[%s] Fetching MOEX ISS data (%d days)...", ticker, HISTORY_DAYS)
+    df = fetch_moex_candles(ticker)
+    if df is None or len(df) < MIN_BARS:
+        got = 0 if df is None else len(df)
+        LOG.error("  ERROR: not enough data for %s (%d bars, need %d)",
+                  ticker, got, MIN_BARS)
+        return None
+    return df
 
-    all_results = []
-    # кэш истории + прогноза (первый горизонт) на тикер, чтобы не дублировать
-    # запрос/инференс в секции графиков
-    chart_data = {}
 
-    for ticker in TICKERS:
-        print(f"\n{'='*80}")
-        print(f"[{ticker}] Fetching MOEX ISS data ({HISTORY_DAYS} days)...")
+def _ticker_context(df):
+    """Контекст окна, разобранный один раз на тикер.
 
-        # 1. Fetch data from MOEX
-        df = fetch_moex_candles(ticker)
-        if df is None or len(df) < MIN_BARS:
-            got = 0 if df is None else len(df)
-            print(f"  ERROR: not enough data for {ticker} ({got} bars, need {MIN_BARS})")
-            continue
+    Календарь торгов выводится из данных, а не предполагается (audit C3);
+    last_price/mean/sigma берутся одним вызовом window_stats(), чтобы цена
+    последнего бара не вычислялась в коде двумя разными способами.
+    """
+    last_price, mean_price, sigma_d = window_stats(df)
+    trades_weekends = has_weekend_sessions(df)
+    last_date = df["begin"].iloc[-1]
 
-        print(f"  Got {len(df)} daily bars")
-        last_price = float(df["close"].iloc[-1])
-        last_date = df["begin"].iloc[-1]
-        print(f"  Period: {df['begin'].iloc[0].date()} — {last_date.date()}")
-        print(f"  Last close: {last_price:.2f} RUB")
+    LOG.info("  Got %d daily bars", len(df))
+    LOG.info("  Period: %s — %s", df["begin"].iloc[0].date(), last_date.date())
+    LOG.info("  Last close: %.2f RUB", last_price)
+    LOG.info("  Trading calendar: %s",
+             "7 days/week (weekend sessions)" if trades_weekends else "Mon-Fri only")
+    LOG.info("  Window: mean=%.2f sigma_d=%.2f%%/day", mean_price, sigma_d * 100)
 
-        # Календарь торгов определяется по данным, а не предполагается (audit C3).
-        trades_weekends = has_weekend_sessions(df)
-        print(f"  Trading calendar: "
-              f"{'7 days/week (weekend sessions)' if trades_weekends else 'Mon-Fri only'}")
+    return {
+        "df": df,
+        "values_np": df["close"].values.astype(np.float32),
+        "last_price": last_price,
+        "mean_price": mean_price,
+        "sigma_d": sigma_d,
+        "last_date": last_date,
+        "trades_weekends": trades_weekends,
+    }
 
-        # Prepare data for both models
-        values_np = df["close"].values.astype(np.float32)
-        last_price, mean_price, sigma_d = window_stats(df)
-        print(f"  Window: mean={mean_price:.2f} sigma_d={sigma_d*100:.2f}%/day")
 
-        results_for_ticker = []
+def _forecast_horizon(ticker, horizon, ctx, kronos_predictor, timesfm_model,
+                      chart_data):
+    """Прогноз обеих моделей на один горизонт. Возвращает строку результата.
 
-        for horizon in HORIZONS:
-            print(f"\n  --- Horizon: {horizon} days ---")
+    Отказ любой из моделей не прерывает прогон: строка получает NO_DATA, и
+    compare_signals() превращает такую пару в «нет данных», а не в согласие.
 
-            # Kronos prediction. Горизонт в днях == число баров, потому что
-            # INTERVAL=24. Предупреждение выставляем по фактическому усечению,
-            # а не по магическому порогу (audit M2).
-            kronos_bars = min(horizon, KRONOS_MAX_PRED_LEN)
-            capped = kronos_bars < horizon
-            print(f"  [Kronos] Predicting {kronos_bars} bars ahead"
-                  + (f" (запрошено {horizon}d, cap={KRONOS_MAX_PRED_LEN})" if capped else "..."))
-            kronos_preds = kronos_predict(kronos_predictor, df, kronos_bars,
-                                          trades_weekends)
+    z печатается через _num(): при SIGNAL_MODE == "abs" compute_signal()
+    возвращает z = None, и форматирование None как числа падало бы с TypeError.
+    """
+    LOG.info("\n  --- Horizon: %s days ---", horizon)
 
-            kronos_z = kronos_excess = None
-            if kronos_preds is not None:
-                kronos_horizon_pred = float(kronos_preds[-1])
-                kronos_signal, kronos_chg, kronos_z = compute_signal(
-                    kronos_horizon_pred, last_price, sigma_d, horizon)
-                kronos_excess = reversion_excess(
-                    kronos_horizon_pred, mean_price, sigma_d, last_price, horizon)
-                print(f"  [Kronos] {horizon}d forecast: "
-                      f"{kronos_horizon_pred:.2f} ({kronos_chg:+.2f}%, "
-                      f"z={kronos_z:+.2f}) -> [{kronos_signal}]")
-            else:
-                kronos_signal = NO_DATA
-                kronos_chg = None
-                kronos_horizon_pred = None
+    # Kronos. Горизонт в днях == число баров, потому что INTERVAL=24.
+    # Предупреждение выставляем по фактическому усечению, а не по
+    # магическому порогу (audit M2).
+    kronos_bars = min(horizon, KRONOS_MAX_PRED_LEN)
+    capped = kronos_bars < horizon
+    LOG.info("  [Kronos] Predicting %d bars ahead%s", kronos_bars,
+             (f" (запрошено {horizon}d, cap={KRONOS_MAX_PRED_LEN})"
+              if capped else "..."))
+    kronos_preds = kronos_predict(kronos_predictor, ctx["df"], kronos_bars,
+                                  ctx["trades_weekends"])
 
-            # TimesFM prediction. max_context=512 покрывает всю историю
-            # (~112 дневных баров), усечения больше нет (audit H4).
-            print(f"  [TimesFM] Predicting {horizon}d ahead...")
-            timesfm_preds = None
-            timesfm_z = timesfm_excess = None
-            try:
-                timesfm_preds = timesfm_forecast(timesfm_model, values_np, horizon)
-                timesfm_horizon_pred = float(timesfm_preds[-1])
-                timesfm_signal, timesfm_chg, timesfm_z = compute_signal(
-                    timesfm_horizon_pred, last_price, sigma_d, horizon)
-                timesfm_excess = reversion_excess(
-                    timesfm_horizon_pred, mean_price, sigma_d, last_price, horizon)
-                print(f"  [TimesFM] {horizon}d forecast: {timesfm_horizon_pred:.2f} "
-                      f"({timesfm_chg:+.2f}%, z={timesfm_z:+.2f}) -> [{timesfm_signal}]")
-            except Exception as e:
-                timesfm_signal = NO_DATA
-                timesfm_chg = None
-                timesfm_horizon_pred = None
-                print(f"  [TimesFM] ERROR: {e}")
+    kronos_z = kronos_excess = None
+    if kronos_preds is not None:
+        kronos_horizon_pred = float(kronos_preds[-1])
+        kronos_signal, kronos_chg, kronos_z = compute_signal(
+            kronos_horizon_pred, ctx["last_price"], ctx["sigma_d"], horizon)
+        kronos_excess = reversion_excess(
+            kronos_horizon_pred, ctx["mean_price"], ctx["sigma_d"],
+            ctx["last_price"], horizon)
+        LOG.info("  [Kronos] %dd forecast: %.2f (%+.2f%%, z=%s) -> [%s]",
+                 horizon, kronos_horizon_pred, kronos_chg,
+                 _num(kronos_z, "+.2f"), kronos_signal)
+    else:
+        kronos_signal = NO_DATA
+        kronos_chg = None
+        kronos_horizon_pred = None
 
-            # Cache the first-horizon history + TimesFM forecast now so the chart
-            # section below doesn't re-fetch MOEX data or re-run the model.
-            # Даты прогноза считаются ТОЙ ЖЕ функцией, что и метки для Kronos,
-            # поэтому ось графика совпадает с длиной прогноза (audit H2).
-            if horizon == HORIZONS[0] and timesfm_preds is not None:
-                chart_data[ticker] = {
-                    "df": df,
-                    "last_price": last_price,
-                    "last_date": last_date,
-                    "tf_preds": timesfm_preds,
-                    "forecast_dates": future_bars(
-                        last_date, len(timesfm_preds), trades_weekends),
-                }
+    # TimesFM. max_context=512 покрывает всю историю (~112 дневных баров),
+    # усечения больше нет (audit H4).
+    LOG.info("  [TimesFM] Predicting %dd ahead...", horizon)
+    timesfm_preds = None
+    timesfm_z = timesfm_excess = None
+    try:
+        timesfm_preds = timesfm_forecast(timesfm_model, ctx["values_np"], horizon)
+        timesfm_horizon_pred = float(timesfm_preds[-1])
+        timesfm_signal, timesfm_chg, timesfm_z = compute_signal(
+            timesfm_horizon_pred, ctx["last_price"], ctx["sigma_d"], horizon)
+        timesfm_excess = reversion_excess(
+            timesfm_horizon_pred, ctx["mean_price"], ctx["sigma_d"],
+            ctx["last_price"], horizon)
+        LOG.info("  [TimesFM] %dd forecast: %.2f (%+.2f%%, z=%s) -> [%s]",
+                 horizon, timesfm_horizon_pred, timesfm_chg,
+                 _num(timesfm_z, "+.2f"), timesfm_signal)
+    except Exception as e:
+        # timesfm_preds обязателен к сбросу: проверка `is not None` ниже
+        # кэширует прогноз в график, и упавший прогноз попал бы в PNG.
+        timesfm_preds = None
+        timesfm_signal = NO_DATA
+        timesfm_chg = None
+        timesfm_horizon_pred = None
+        LOG.error("  [TimesFM] ERROR: %s", e)
 
-            agreement, confidence = compare_signals(kronos_signal, timesfm_signal)
+    # Кэш истории + прогноза первого горизонта, чтобы секция графиков не
+    # перезапрашивала MOEX и не гоняла модель второй раз. Даты считаются
+    # ТОЙ ЖЕ функцией, что и метки для Kronos, поэтому ось графика совпадает
+    # с длиной прогноза (audit H2).
+    if horizon == HORIZONS[0] and timesfm_preds is not None:
+        chart_data[ticker] = {
+            "df": ctx["df"],
+            "last_price": ctx["last_price"],
+            "last_date": ctx["last_date"],
+            "tf_preds": timesfm_preds,
+            "forecast_dates": future_bars(
+                ctx["last_date"], len(timesfm_preds), ctx["trades_weekends"]),
+        }
 
-            results_for_ticker.append({
-                "ticker": ticker,
-                "horizon": horizon,
-                "last_price": last_price,
-                "mean_price": mean_price,
-                "sigma_d": sigma_d,
-                "kronos_pred": kronos_horizon_pred,
-                "kronos_signal": kronos_signal,
-                "kronos_chg": kronos_chg,
-                "kronos_z": kronos_z,
-                "kronos_excess": kronos_excess,
-                "timesfm_pred": timesfm_horizon_pred,
-                "timesfm_signal": timesfm_signal,
-                "timesfm_chg": timesfm_chg,
-                "timesfm_z": timesfm_z,
-                "timesfm_excess": timesfm_excess,
-                "agreement": agreement,
-                "confidence": confidence,
-            })
+    agreement, confidence = compare_signals(kronos_signal, timesfm_signal)
 
-        all_results.extend(results_for_ticker)
+    return {
+        "ticker": ticker,
+        "horizon": horizon,
+        "last_price": ctx["last_price"],
+        "mean_price": ctx["mean_price"],
+        "sigma_d": ctx["sigma_d"],
+        "kronos_pred": kronos_horizon_pred,
+        "kronos_signal": kronos_signal,
+        "kronos_chg": kronos_chg,
+        "kronos_z": kronos_z,
+        "kronos_excess": kronos_excess,
+        "timesfm_pred": timesfm_horizon_pred,
+        "timesfm_signal": timesfm_signal,
+        "timesfm_chg": timesfm_chg,
+        "timesfm_z": timesfm_z,
+        "timesfm_excess": timesfm_excess,
+        "agreement": agreement,
+        "confidence": confidence,
+    }
 
-    # ── Output comparison table ────────────────────────────────
-    print(f"\n{'='*80}")
-    print("COMPARISON TABLE")
-    print("=" * 80)
 
-    sections = []
-    for horizon in HORIZONS:
-        table = render_table(all_results, horizon)
-        sections.append(table)
-        print(f"\n--- Прогноз на {horizon} дней ---")
-        print(table)
+def _write_report(now_str, tables, interpretation, diagnostics):
+    """Дописать секцию прогона в logs/comparison_YYYYMMDD.log. Возвращает путь.
 
-    # ── Interpretation ─────────────────────────────────────────
-    interpretation = render_interpretation(all_results, HORIZONS[0])
-    print(f"\n{'='*80}")
-    print("INTERPRETATION")
-    print("=" * 80)
-    print(interpretation)
-
-    # ── Diagnostics: is the forecast more than mechanical reversion? ──
-    diagnostics = render_diagnostics(all_results)
-    print(f"\n{'='*80}")
-    print("MODEL DIAGNOSTICS (z_excess ~ 0 => прогноз = арифметика окна)")
-    print("=" * 80)
-    print(diagnostics)
-
-    # ── Save chart (первый горизонт) ───────────────────────────
-    print(f"\n{'='*80}")
-    print("Saving charts...")
-    save_chart(chart_data, HORIZONS[0])
-
-    # ── Save results to log file ───────────────────────────────
-    LOG_DIR = os.path.join(SCRIPT_DIR, "logs")
-    os.makedirs(LOG_DIR, exist_ok=True)
-    log_path = os.path.join(LOG_DIR, f"comparison_{datetime.date.today().strftime('%Y%m%d')}.log")
+    Формат закреплён logs/README.md: строки `units:` и `signal mode:` —
+    маркер, по которому записи до и после 2026-10-14 различаются. Менять
+    разметку здесь нельзя, иначе старые прогоны станут неотличимы от новых,
+    а именно по ним считалась вся сверка юнитов.
+    """
+    log_dir = os.path.join(SCRIPT_DIR, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(
+        log_dir, f"comparison_{datetime.date.today().strftime('%Y%m%d')}.log")
 
     with open(log_path, "a", encoding="utf-8") as lf:
         lf.write(f"\n{'='*80}\n")
@@ -715,7 +804,7 @@ def main():
                  f"horizons={HORIZONS} days, seeds={SEED}\n")
         lf.write(f"signal mode: {SIGNAL_MODE} (порог ±{Z_THRESHOLD:.0f}σ)\n")
         lf.write(f"{'='*80}\n")
-        for horizon, table in zip(HORIZONS, sections):
+        for horizon, table in zip(HORIZONS, tables):
             lf.write(f"\n--- Прогноз на {horizon} дней ---\n{table}\n")
         lf.write(f"\n{'='*80}\n")
         lf.write("INTERPRETATION\n")
@@ -726,15 +815,79 @@ def main():
         lf.write("=" * 80 + "\n")
         lf.write(diagnostics + "\n")
         lf.write(f"\n{'='*80}\nDONE\n{'='*80}\n")
+    return log_path
 
-    print(f"Log saved: {log_path}")
+
+def main():
+    """Полный прогон: баннер → модели → тикеры × горизонты → отчёт → график."""
+    _setup_logging()
+    now_str = datetime.datetime.now(tz=ZoneInfo("Europe/Moscow")).strftime(
+        "%Y-%m-%d %H:%M MSK")
+    _banner(now_str)
+
+    torch.manual_seed(SEED)  # см. SEED
+
+    LOG.info("\n[INIT] Loading Kronos-mini...")
+    kronos_predictor = load_kronos()
+
+    LOG.info("\n[INIT] Loading TimesFM 2.5...")
+    timesfm_model = load_timesfm()
+
+    all_results = []
+    # кэш истории + прогноза (первый горизонт) на тикер, чтобы не дублировать
+    # запрос/инференс в секции графиков
+    chart_data = {}
+
+    for ticker in TICKERS:
+        df = _fetch_ticker(ticker)
+        if df is None:
+            continue
+        ctx = _ticker_context(df)
+        for horizon in HORIZONS:
+            all_results.append(_forecast_horizon(
+                ticker, horizon, ctx, kronos_predictor, timesfm_model, chart_data))
+
+    # ── Output comparison table ────────────────────────────────
+    LOG.info("\n%s", "=" * 80)
+    LOG.info("COMPARISON TABLE")
+    LOG.info("=" * 80)
+
+    tables = []
+    for horizon in HORIZONS:
+        table = render_table(all_results, horizon)
+        tables.append(table)
+        LOG.info("\n--- Прогноз на %d дней ---", horizon)
+        LOG.info("%s", table)
+
+    # ── Interpretation ─────────────────────────────────────────
+    interpretation = render_interpretation(all_results, HORIZONS[0])
+    LOG.info("\n%s", "=" * 80)
+    LOG.info("INTERPRETATION")
+    LOG.info("=" * 80)
+    LOG.info("%s", interpretation)
+
+    # ── Diagnostics: is the forecast more than mechanical reversion? ──
+    diagnostics = render_diagnostics(all_results)
+    LOG.info("\n%s", "=" * 80)
+    LOG.info("MODEL DIAGNOSTICS (z_excess ~ 0 => прогноз = арифметика окна)")
+    LOG.info("=" * 80)
+    LOG.info("%s", diagnostics)
+
+    # ── Save chart (первый горизонт) ───────────────────────────
+    LOG.info("\n%s", "=" * 80)
+    LOG.info("Saving charts...")
+    save_chart(chart_data, HORIZONS[0])
+
+    # ── Save results to log file ───────────────────────────────
+    log_path = _write_report(now_str, tables, interpretation, diagnostics)
+    LOG.info("Log saved: %s", log_path)
 
 
 def save_chart(chart_data, horizon, out_path=None):
     """Построить график истории + прогноза. Ось X = реальные торговые дни."""
     tickers = [t for t in TICKERS if t in chart_data]
     if not tickers:
-        print("  График не построен: нет ни одного успешного прогноза TimesFM.")
+        LOG.info("  График не построен: нет ни одного успешного прогноза TimesFM.")
         return
 
     fig, axes = plt.subplots(len(tickers), 1, figsize=(14, 5 * len(tickers)),
@@ -772,7 +925,7 @@ def save_chart(chart_data, horizon, out_path=None):
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
-    print(f"Chart saved: {out_path}")
+    LOG.info("Chart saved: %s", out_path)
 
 
 if __name__ == "__main__":
