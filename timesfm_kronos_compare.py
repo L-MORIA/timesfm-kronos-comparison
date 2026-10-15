@@ -191,21 +191,31 @@ def fetch_moex_candles(ticker, days=HISTORY_DAYS):
     if not rows or not cols:
         return None
 
-    df = pd.DataFrame(rows, columns=cols)
-    # MOEX ISS отдаёт колонки уже в нижнем регистре
-    # (['open','close','high','low','value','volume','begin','end']) и может
-    # вернуть другой регистр в зависимости от endpoint — приводим к нижнему
-    # регистру до маппинга. Старая карта {"OPEN": "open", ...} была no-op,
-    # из-за чего схема молча не проверялась.
+    return normalize_candles(pd.DataFrame(rows, columns=cols), ticker)
+
+
+def normalize_candles(df, ticker=None):
+    """Привести сырой ответ MOEX к внутренней схеме.
+
+    Единственный источник правды о преобразовании колонок: используется и
+    продом, и бэктестом. Раньше схема дублировалась в разных местах, и
+    бэктест падал с `KeyError: 'amount'`, потому что в нём был свой
+    экземпляр сырых колонок.
+
+    - регистр приводится к нижнему: MOEX отдаёт `open/close/...`, но может
+      вернуть другой регистр в зависимости от endpoint;
+    - оборот `value` -> `amount`, как ждёт Kronos (kronos.py:491). Иначе он
+      подставляет аппроксимацию volume*mean(price) (kronos.py:531) — audit H3;
+    - незакрытый бар текущего дня отбрасывается — audit, часть 5.
+    """
+    df = df.copy()
     df.columns = [str(c).strip().lower() for c in df.columns]
     missing = [c for c in ("open", "high", "low", "close", "volume", "value", "begin")
                if c not in df.columns]
     if missing:
         print(f"  [{ticker}] неожиданная схема MOEX, нет колонок: {missing}")
         return None
-    # Оборот в рублях: Kronos ждёт колонку с именем 'amount'
-    # (kronos.py:491). Без неё он подставляет аппроксимацию
-    # volume*mean(price) (kronos.py:531) — audit H3.
+
     df = df.rename(columns={"value": "amount"})
     df["begin"] = pd.to_datetime(df["begin"])
 
@@ -216,9 +226,9 @@ def fetch_moex_candles(ticker, days=HISTORY_DAYS):
             .sort_values("begin")
             .reset_index(drop=True))
     df = df[df["close"] > 0].reset_index(drop=True)
-    # Сегодняшний бар может быть незакрытым — отбрасываем (audit, часть 5)
+
     df, dropped = drop_incomplete_daily(df)
-    if dropped:
+    if dropped and ticker:
         print(f"  [{ticker}] отброшен незакрытый бар текущего дня — "
               f"последнее закрытие = предыдущая сессия")
     return df
