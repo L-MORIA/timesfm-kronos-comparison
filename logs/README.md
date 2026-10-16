@@ -65,3 +65,28 @@ Cron-задача в чат доставляет **stdout** (обёртка чи
 Cron задачи `TimesFM+Kronos MOEX Comparison` сам этот каталог не пишет —
 он зовёт проектный скрипт напрямую через обёртку hermes, а скрипт уже
 дописывает `comparison_YYYYMMDD.log`.
+
+## Кодировка артефактов (`*.txt`) — урок 2026-10-16
+
+`python script.py > file` в PowerShell даёт кракозябры (`╨и╨Р╨У`): PS читает
+UTF-8-вывод python по кодовой странице консоли (CP866) и переписывает
+в файл уже искажённым. Так были повреждены 18 логов за 15–16.10.
+
+**Правильный запуск вывода в файл:**
+
+```powershell
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+python experiments\panel_daily.py ... > logs\panel_full.txt
+```
+
+**Восстановление уже повреждённого файла** (двойное кодирование обратимо:
+utf-8 → cp866-трактовка → utf-8; это ровно цепочка возникновения):
+
+```python
+raw = open(p, 'rb').read()
+fixed = raw.decode('utf-8').encode('cp866').decode('utf-8')
+open(p, 'w', encoding='utf-8', newline='').write(fixed)
+```
+
+Маркер поражения — блочные знаки U+25xx (`E2 95` в байтах). Оригиналы
+исправленных файлов сохранены в `_mojibake_backup_20261016/`.
