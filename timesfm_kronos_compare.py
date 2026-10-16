@@ -31,8 +31,20 @@ import requests
 # со скриптом, а не в cwd — cron может запускать из любой директории.
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Force CPU mode before importing torch (RTX 5060 Ti sm_120 not supported)
-os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+# Устройство инференса выбирается ОДИН РАЗ, до импорта torch.
+# История: до 2026-10-16 стоял форс "cpu" + CUDA_VISIBLE_DEVICES=-1 — это был
+# обход отсутствия sm_120-кирнелов в PyTorch той эпохи. С torch 2.7+ (cu128),
+# а тем более 2.13+cu130, Blackwell RTX 50xx поддержан: smoke-тест на этой
+# машине — cap (12,0), matmul без «no kernel image».
+# Ручной выбор: TFKC_DEVICE=cpu|cuda|auto (по умолчанию auto).
+TFKC_DEVICE = os.environ.get("TFKC_DEVICE", "auto").strip().lower()
+if TFKC_DEVICE not in ("auto", "cpu", "cuda"):
+    TFKC_DEVICE = "auto"
+if TFKC_DEVICE == "cpu":
+    # Прячем GPU до импорта torch: TimesFM сам детектит cuda в from_pretrained
+    # (timesfm_2p5_torch.py:72-83), Kronos получает device через аргумент —
+    # оба должны видеть одно и то же.
+    os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 
 # Fix SIGSEGV in Kronos decode_s1() on CPU PyTorch builds (sm_120 not supported).
 # PyTorch >2.x with OMP/MKL threads > 1 races during the long autoregressive
@@ -323,6 +335,23 @@ def drop_incomplete_daily(df, now=None):
 
 # ── Kronos Mini (из проекта kronos-signal) ─────────────────────
 
+def resolve_device():
+    """Устройство инференса: TFKC_DEVICE или авто-детект.
+
+    "cpu" уже гарантирует CUDA_VISIBLE_DEVICES=-1 (выставлен до импорта
+    torch), поэтому TimesFM (само-детект) и Kronos (аргумент) сходятся
+    на одном устройстве. "cuda" без доступного GPU — честная ошибка, а не
+    тихий откат: молчаливая подмена устройства меняет числа.
+    """
+    if TFKC_DEVICE == "cpu":
+        return "cpu"
+    if TFKC_DEVICE == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(
+            "TFKC_DEVICE=cuda, но CUDA недоступна — проверь билд torch "
+            f"({torch.__version__}) и драйвер")
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
 def load_kronos():
     """Load Kronos-mini from local project (same as kronos-signal/run.py)."""
     KRONOS_PROJECT = os.path.expanduser("~/kronos-signal")
@@ -340,8 +369,7 @@ def load_kronos():
     tok = KronosTokenizer.from_pretrained(TOKENIZER_PATH)
     model = Kronos.from_pretrained(MODEL_PATH)
 
-    # Force CPU mode due to RTX 5060 Ti CUDA incompatibility (sm_120 not supported)
-    device = "cpu"
+    device = resolve_device()
     predictor = KronosPredictor(model, tok, device=device, max_context=2048)
     LOG.info("[Kronos] Ready (device=%s)", device)
     return predictor
@@ -425,7 +453,8 @@ def load_timesfm():
     config = ForecastConfig(max_context=512, max_horizon=TIMESFM_MAX_HORIZON)
     LOG.info("[TimesFM] Compiling...")
     model.compile(config)
-    LOG.info("[TimesFM] Ready (device=cpu)!")
+    LOG.info("[TimesFM] Ready (device=%s)!",
+             ("cuda" if torch.cuda.is_available() and TFKC_DEVICE != "cpu" else "cpu"))
     return model
 
 

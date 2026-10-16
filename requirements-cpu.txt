@@ -1,14 +1,15 @@
-# timesfm-kronos-comparison dependencies (CPU-only — DEFAULT & RECOMMENDED)
+# timesfm-kronos-comparison dependencies (CPU-only — fallback, не обязателен)
 # Python 3.12; install inside the project's .venv (NOT Hermes global venv):
 #   uv venv .venv --python 3.12
-#   uv pip install -r requirements.txt
+#   uv pip install -r requirements-cpu.txt
 #
-# REALITY CHECK (2026-07-17): RTX 5060 Ti (Blackwell, sm_120) is NOT SUPPORTED
-# by current PyTorch (stable or nightly). CUDA kernels fail with:
-# "no kernel image is available for execution on the device"
-# 
-# Use CPU-only build. If you have Ampere (RTX 30xx, A100, sm_80+) or Hopper (H100, sm_90),
-# see requirements-cuda.txt
+# UPDATE 2026-10-16: прежний «REALITY CHECK (2026-07-17): sm_120 не поддержан
+# stable/nightly» БОЛЬШЕ НЕ ВЕРЕН. Blackwell поддержан с PyTorch 2.7+cu128
+# (апрель 2025); на этой машине проверен torch 2.13.0+cu130 + драйвер 617.42.
+# CPU-вариант оставлен как fallback и для детерминизма (cuBLAS на GPU не
+# гарантирует бит-в-бит повторяемость прогонов).
+#
+# Force CPU в коде: TFKC_DEVICE=cpu (CUDA_VISIBLE_DEVICES ставится сам).
 
 requests
 numpy
