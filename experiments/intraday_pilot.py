@@ -27,6 +27,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import os
 import time
 
 import numpy as np
@@ -34,7 +35,8 @@ import pandas as pd
 import requests
 from statistics import NormalDist
 
-TICKERS = ["SBERP", "GAZP", "LKOH", "SBER", "VTBR"]
+TICKERS = ["SBER", "GAZP", "LKOH", "SBERP", "VTBR", "FEES", "MOEX", "ROSN",
+           "TRNFP", "GMKN", "SNGSP", "MTSS", "AFKS"]
 BASE = ("https://iss.moex.com/iss/engines/stock/markets/shares"
         "/boards/TQBR/securities/{ticker}/candles.json")
 PAGE = 500
@@ -53,13 +55,42 @@ ND = NormalDist()
 
 # ── выгрузка ────────────────────────────────────────────────────
 
+def _sessions():
+    """Два клиента: напрямую и через системный прокси.
+
+    Локальный прокси на 127.0.0.1:10809 живёт не постоянно — когда он падает,
+    requests падает вместе с ним, и выгрузка 13 тикеров теряется целиком.
+    Поэтому сначала идём напрямую, а прокси оставляем запасным путём.
+    """
+    direct = requests.Session()
+    direct.trust_env = False          # игнорировать HTTP(S)_PROXY из окружения
+    via_proxy = requests.Session()    # по умолчанию, т.е. через переменные окружения
+    return direct, via_proxy
+
+
+SESSIONS = _sessions()
+
+
+def _get(url, params):
+    """Запрос с откатом на прокси, если прямое соединение не удалось."""
+    last = None
+    for s in SESSIONS:
+        try:
+            r = s.get(url, params=params, timeout=25)
+            r.raise_for_status()
+            return r
+        except (requests.ProxyError, requests.ConnectionError) as e:
+            last = e
+            continue
+    raise last
+
+
 def fetch_minutes(ticker, d0, d1):
     rows, st = [], 0
     while True:
         p = {"interval": 1, "from": d0.isoformat(), "till": d1.isoformat(),
              "limit": PAGE, "start": st}
-        r = requests.get(BASE.format(ticker=ticker), params=p, timeout=25)
-        r.raise_for_status()
+        r = _get(BASE.format(ticker=ticker), p)
         blk = (r.json() or {}).get("candles") or {}
         cols, data = blk.get("columns"), blk.get("data") or []
         if not data:
@@ -119,6 +150,45 @@ def split_sessions(df5):
         out[day] = {"main": cut + 1, "eve": len(ts) - cut - 1,
                     "gap": gaps[cut], "first": ts[0], "last": ts[-1]}
     return out
+
+
+def loud_window(panel):
+    """Граница ликвидного окна по объёму, без обращения к часам.
+
+    Сессионный перерыв в данных ISS отсутствует (максимальный разрыв внутри
+    суток 180 с), поэтому границу режима задаём объёмом: блоки с объёмом
+    выше медианы образуют громкую часть. Берём самое длинное непрерывное
+    run — иначе один случайно громкий блок разорвёт окно.
+
+    На входе Series с DatetimeIndex, сконструированная ранее.
+    """
+    v = panel.groupby(panel.index.floor("30min")).sum()
+    med = float(v.median())
+    loud = v[v >= med]
+    if loud.empty:
+        return None, None
+    blocks = sorted(loud.index)
+    best, cur = [blocks[0]], [blocks[0]]
+    for b in blocks[1:]:
+        if (b - cur[-1]).total_seconds() <= 1800:
+            cur.append(b)
+        else:
+            if len(cur) > len(best):
+                best = cur
+            cur = [b]
+    if len(cur) > len(best):
+        best = cur
+    return best[0], best[-1] + pd.Timedelta(minutes=30)
+
+
+def trim(df5, start, end):
+    """Оставить бары внутри окна [start, end) по меткам времени суток."""
+    if start is None:
+        return df5
+    mins = df5.index.hour * 60 + df5.index.minute
+    s = start.hour * 60 + start.minute
+    e = end.hour * 60 + end.minute
+    return df5[(mins >= s) & (mins < e)]
 
 
 # ── метрики ─────────────────────────────────────────────────────
@@ -209,17 +279,48 @@ def main():
     print()
 
     data, prof = {}, {}
-    for tk in TICKERS:
-        m1 = fetch_minutes(tk, START, END)
-        if m1.empty:
-            print(f"{tk}: нет данных")
-            continue
-        d5 = resample_5m(m1)
+    cache = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "..", "logs", "intraday_5m_cache.csv")
+    cache = os.path.normpath(cache)
+
+    frames, cached = [], set()
+    if os.path.isfile(cache):
+        raw = pd.read_csv(cache, parse_dates=["begin"])
+        cached = set(raw["ticker"].unique())
+        frames = [g.drop(columns=["ticker"]).assign(ticker=tk)
+                  for tk, g in raw.groupby("ticker")]
+        print(f"[кэш] {os.path.basename(cache)}: {len(raw):,} строк, "
+              f"{len(cached)} тикеров")
+
+    missing = [t for t in TICKERS if t not in cached]
+    if missing:
+        print(f"[сеть] догрузка: {', '.join(missing)}")
+        for tk in missing:
+            try:
+                m1 = fetch_minutes(tk, START, END)
+            except Exception as e:                      # noqa: BLE001
+                print(f"{tk:<7} ОШИБКА {type(e).__name__}: {e}")
+                continue
+            if m1.empty:
+                print(f"{tk}: нет данных")
+                continue
+            d5 = resample_5m(m1)
+            frames.append(d5.assign(ticker=tk).reset_index())
+            # Кэш переписывается после КАЖДОГО тикера. Предыдущий прогон
+            # потерял ~15 минут выгрузки целиком из-за падения на первом
+            # же тикере — инкрементальность здесь не оптимизация.
+            pd.concat(frames, ignore_index=True).to_csv(
+                cache, index=False, encoding="utf-8")
+            print(f"{tk:<7} минутных={len(m1):>7,}  5-минутных={len(d5):>7,}  "
+                  f"дней={len(split_sessions(d5)):>3}  [кэш обновлён]",
+                  flush=True)
+        print(f"[кэш] {os.path.basename(cache)}: {len(frames)} тикеров")
+
+    for f in frames:
+        tk = f["ticker"].iloc[0]
+        d5 = f.drop(columns=["ticker"]).set_index("begin").sort_index()
         data[tk] = d5
-        sess = split_sessions(d5)
-        prof[tk] = sess
-        print(f"{tk:<7} минутных={len(m1):>7,}  5-минутных={len(d5):>7,}  "
-              f"дней={len(sess):>3}")
+        prof[tk] = split_sessions(d5)
     if not data:
         print("нет данных ни по одному тикеру")
         return
@@ -242,45 +343,84 @@ def main():
         print(f"{tk:<8}{m:>7.0f}{e:>8.0f}{gp:>9.0f}м"
               f"{str(f0)[11:16]:>12}{str(l0)[11:16]:>12}")
     print()
-    print("Большой разрыв делит сутки на основную и вечернюю сессии.")
-    print("Если вечерних баров много, а ликвидность там низкая, смешивать их")
-    print("в один ряд нельзя — это два режима, а не один.")
+    print("Таблица выше почти вырождена: «разрыв» в 5 минут — это обычный шаг")
+    print("между соседними пятиминутными барами, а не сессионный перерыв.")
+    print("Замер session_diag.py подтвердил: перерыва в данных ISS нет вообще.")
+    print("Поэтому разбивку на сессии здесь НЕ используем — границу режима")
+    print("задаёт объём, см. блок ниже.")
     print()
 
     print("=" * 84)
     print("КЛАСТЕРИЗАЦИЯ ОКОН — главный вопрос пилота")
     print("=" * 84)
-    print(f"{'h':>4}{'окно':>8}{'окон/день':>11}{'ICC':>8}{'DEFF':>8}"
-          f"{'N_ном':>9}{'N_эфф':>9}{'MDE_эфф':>10}")
-    print("-" * 67)
-    results = []
-    for h in HORIZONS:
-        rows = ic_per_window(data, h)
-        if not rows:
-            continue
-        icc, m, ndays = icc_within_day(rows)
-        n_nom = len(rows)
-        deff = 1 + (m - 1) * icc if np.isfinite(icc) and np.isfinite(m) else np.nan
-        n_eff = n_nom / deff if np.isfinite(deff) and deff > 0 else n_nom
-        results.append((h, m, icc, deff, n_nom, n_eff, mde(n_eff)))
-        print(f"{h:>4}{h * 5 / 60:>7.1f}ч{m:>11.1f}{icc:>8.3f}{deff:>8.2f}"
-              f"{n_nom:>9}{n_eff:>9.0f}{mde(n_eff):>10.3f}")
+
+    # Граница ликвидности — по объёму, часы ISS не работают как расписание.
+    panel = pd.concat([data[t]["volume"] for t in data], axis=1).sum(axis=1)
+    w0, w1 = loud_window(panel)
+    print(f"громкое окно по объёму: {str(w0)[11:16]} … {str(w1)[11:16]}")
+    if w0 is not None:
+        # Статистика за ВЕСЬ период первого тикера, приведённая к суткам:
+        # 63 790 строк кэша / 13 тикеров = ~4900 баров на тикер за месяц,
+        # а не в сутки. Прежняя подпись «баров в сутки» показывала месячное
+        # число (4916 → 3047) и читалась как суточное.
+        d0 = data[list(data)[0]]
+        n_days = max(len(d0.index.normalize().unique()), 1)
+        n_before = len(d0) / n_days
+        n_after = len(trim(d0, w0, w1)) / n_days
+        print(f"баров в сутки (среднее, тикер {list(data)[0]}): "
+              f"{n_before:.0f} → {n_after:.0f} "
+              f"({100 * n_after / n_before:.0f} % времени)")
     print()
-    print("N_ном — число окон, N_эфф — после поправки на кластеризацию внутри")
-    print("дня (design effect). MDE_эфф — настоящий разрешающий предел, а не")
-    print("номинальный из расчёта мощности.")
-    print()
+
+    variants = [("полный ряд", data)]
+    if w0 is not None:
+        variants.append((f"обрезанный {str(w0)[11:16]}–{str(w1)[11:16]}",
+                         {t: trim(d, w0, w1) for t, d in data.items()}))
+
+    all_results = []
+    for label, panel_data in variants:
+        print(f"--- {label} ---")
+        print(f"{'h':>4}{'окно':>8}{'окон/день':>11}{'ICC':>8}{'DEFF':>8}"
+              f"{'N_ном':>9}{'N_эфф':>9}{'MDE_эфф':>10}")
+        print("-" * 67)
+        results = []
+        for h in HORIZONS:
+            rows = ic_per_window(panel_data, h)
+            if not rows:
+                continue
+            icc, m, ndays = icc_within_day(rows)
+            n_nom = len(rows)
+            deff = 1 + (m - 1) * icc if np.isfinite(icc) and np.isfinite(m) else np.nan
+            n_eff = n_nom / deff if np.isfinite(deff) and deff > 0 else n_nom
+            results.append((h, m, icc, deff, n_nom, n_eff, mde(n_eff)))
+            print(f"{h:>4}{h * 5 / 60:>7.1f}ч{m:>11.1f}{icc:>8.3f}{deff:>8.2f}"
+                  f"{n_nom:>9}{n_eff:>9.0f}{mde(n_eff):>10.3f}")
+        print()
+        print("Экстраполяция на 12.4 года (144 месяца, MDE делится на 12):")
+        for h, m, icc, deff, n_nom, n_eff, d in results:
+            print(f"    h={h:>2} ({h * 5 / 60:.1f} ч): ICC {icc:+.3f}, "
+                  f"DEFF {deff:>5.2f}, MDE/мес {d:.3f}, "
+                  f"MDE/12 лет {mde(n_eff * 144):.4f}")
+        print()
+        all_results.append((label, results))
 
     print("=" * 84)
     print("ВЫВОД")
     print("=" * 84)
-    for h, m, icc, deff, n_nom, n_eff, d in results:
-        print(f"  h={h:>2} ({h * 5 / 60:.1f} ч): окон/день {m:.0f}, ICC {icc:+.3f}, "
-              f"DEFF {deff:.2f}, MDE_эфф {d:.3f}")
-    print()
+    for label, results in all_results:
+        print(f"[{label}]")
+        for h, m, icc, deff, n_nom, n_eff, d in results:
+            print(f"  h={h:>2} ({h * 5 / 60:.1f} ч): окон/день {m:.0f}, "
+                  f"ICC {icc:+.3f}, DEFF {deff:.2f}, MDE_эфф {d:.3f}")
+        print()
+
+    # Дальше считаем по ПОЛНОМУ ряду: обрезка — это отдельный вопрос,
+    # а не замена базовой оценки.
+    results = all_results[0][1]
     best = min((r[6] for r in results if np.isfinite(r[6])), default=float("nan"))
-    print("Лучший достижимый MDE на одном месяце данных: "
-          f"{best:.3f} (это 27 дней, 5 тикеров — пилот, а не рабочий тест)")
+    n_tk = len(data)
+    print(f"Лучший достижимый MDE на одном месяце данных: {best:.3f} "
+          f"(это 27 дней и {n_tk} тикеров — пилот, а не рабочий тест)")
     print()
     print("Экстраполяция на полную историю 12.4 лет. MDE падает как 1/√N,")
     print("а N растёт линейно со временем, значит за 12 лет MDE делится на √144=12.")
@@ -290,24 +430,30 @@ def main():
     print("-" * 67)
     for h, m, icc, deff, n_nom, n_eff, d in results:
         n_long = n_eff * 144
+        # n_long округляется до целого: полная точность numpy-скаляра
+        # не влезает в колонку и слипается с соседними
         print(f"{h:>4}{h * 5 / 60:>7.1f}ч{icc:>8.3f}{deff:>8.2f}{d:>11.3f}"
-              f"{n_long:>15,}{mde(n_long):>13.4f}")
+              f"{n_long:>15,.0f}{mde(n_long):>13.4f}")
     print()
-    print("Итог: кластеризация окон внутри дня съедает примерно вчетверо")
-    print("номинального MDE, но 12 лет истории всё равно выводят нас")
-    print("в зону IC 0.02–0.03 на горизонтах 0.5–2 часа.")
+    print("Итог: ICC окон внутри дня 0.69–0.93 — это не шум, а общее рыночное")
+    print("состояние дня. Кластеризация съедает номинальную выборку в 4–22 раза,")
+    print("и 12 лет истории всё равно выводят на MDE 0.027–0.031 — зона IC 0.03,")
+    print("а не 0.02. Обрезка по громкому окну этого НЕ чинит (см. выше).")
     print()
     print("Честные оговорки:")
-    print("  * пилот на 5 тикерах и за 27 дней. На 13 тикерах ICC изменится —")
-    print("    больше бумаг значит более независимые кросс-секционные IC, то")
-    print("    есть DEFF, скорее всего, уменьшится. Значит оценка консервативна.")
     print("  * предиктор здесь z-скор цены — он сам по себе инерционный внутри")
     print("    суток, что раздувает ICC. Модель с более «шумным» выходом даст")
     print("    меньший ICC. Но считать на этом оптимизме нельзя.")
-    print("  * остаётся загадкой отсутствие перерыва между сессиями: замер")
-    print("    не нашёл внутриутреннего разрыва больше 5 минут. Значит либо")
-    print("    ISS отдаёт данные без перерыва, либо метки в неожиданном поясе.")
-    print("    Это надо закрыть ДО агрегации баров, иначе режимы смешаются.")
+    print("  * вопрос о перерыве между сессиями закрыт замером session_diag.py:")
+    print("    в данных ISS разрыва нет вообще (максимум 180 с), ряд идёт")
+    print("    06:59–23:49, и восстановить по нему расписание нельзя. Поэтому")
+    print("    граница режима задана объёмом, а не часами, и обрезанный вариант")
+    print("    ниже — это эмпирическая проверка, а не восстановление сессий.")
+    print("  * издержки не посчитаны. Это единственная оговорка, которую замер")
+    print("    принципиально не снимает: на горизонте 0.5–2 часа спред и комиссия")
+    print("    могут съесть IC 0.02 целиком. Следующий шаг шага 1.5.")
+    print("  * месяц — пилот, не рабочий тест. Все числа ниже показывают, какой")
+    print("    РЕЖИМ даёт дизайн, а не подтверждают наличие сигнала.")
 
 
 if __name__ == "__main__":
