@@ -87,6 +87,23 @@ def effective_n(ic, series, lags):
     return n_eff, t_eff
 
 
+def mde(n_eff, alpha_z=2.0):
+    """Минимальный обнаружимый |IC| при заданном пороге |t_eff|.
+
+    Из t_eff = IC · √N_eff следует, что ячейка на границе значимости
+    (|t_eff| = alpha_z) соответствует |IC| = alpha_z / √N_eff.
+
+    Это не «точность измерения» в смысле доверительного интервала, а
+    разрешающая способность теста: всё, что слабее этого значения, тест
+    физически не может отличить от нуля, сколько бы данных ни набрать.
+    Без этой величины «не значимо» читается как «силы нет», хотя правильный
+    вывод — «силы меньше MDE не видно».
+    """
+    if not np.isfinite(n_eff) or n_eff <= 0:
+        return np.nan
+    return alpha_z / np.sqrt(n_eff)
+
+
 def main(df=None, step=10):
     m = load()
     if df is None:
@@ -94,13 +111,15 @@ def main(df=None, step=10):
     df = df.copy()
     df["date"] = pd.to_datetime(df["date"])
 
-    print("=" * 84)
+    print("=" * 96)
     print("t-статистика IC с учётом перекрытия окон (Newey-West-подобная поправка)")
-    print("=" * 84)
-    print(f"шаг тестовых дат = {step} дней; NaN — t наивный, t_eff — поправленный\n")
+    print("=" * 96)
+    print(f"шаг тестовых дат = {step} дней; NaN — t наивный, t_eff — поправленный")
+    print("MDE — минимальный обнаружимый |IC|: слабее него тест не может отличить")
+    print("      IC от нуля в принципе, а не из-за нехватки данных.\n")
 
     hdr = (f"{'предиктор':<17}{'h':>4}{'N':>6}{'IC':>8}{'t_naive':>9}"
-           f"{'N_eff':>8}{'t_eff':>8}{'вердикт':>12}")
+           f"{'N_eff':>8}{'t_eff':>8}{'MDE':>8}{'вердикт':>12}")
     print(hdr)
     print("-" * len(hdr))
 
@@ -125,22 +144,53 @@ def main(df=None, step=10):
 
             sig = ("значим" if abs(t_eff) >= 2 else "не значим")
             print(f"{p:<17}{h:>4}{len(ok):>6}{ic:>8.3f}{t_naive:>9.2f}"
-                  f"{n_eff:>8.1f}{t_eff:>8.2f}{sig:>12}")
-            verdicts[(p, h)] = (ic, t_eff)
+                  f"{n_eff:>8.1f}{t_eff:>8.2f}{mde(n_eff):>8.3f}{sig:>12}")
+            verdicts[(p, h)] = (ic, t_eff, n_eff)
         print(f"{'':17}  (перекрытие L = {L} соседних наблюдений)")
         print()
 
-    print("=" * 84)
+    print("=" * 96)
     print("ИТОГ")
-    print("=" * 84)
+    print("=" * 96)
     strong = {k: v for k, v in verdicts.items() if abs(v[1]) >= 2}
     if not strong:
         print("Ни один предиктор не пережил поправку на перекрытие окон.")
         print("Прежние «значимые» t были завышены примерно в √L раз.")
     else:
         print("Пережили поправку:")
-        for (p, h), (ic, t) in sorted(strong.items(), key=lambda kv: -abs(kv[1][1])):
+        for (p, h), (ic, t, n) in sorted(strong.items(), key=lambda kv: -abs(kv[1][1])):
             print(f"  {p:<17} h={h:<3} IC={ic:+.3f}  t_eff={t:+.2f}")
+
+    print()
+    print("=" * 96)
+    print("ЧТО ЭТОТ ТЕСТ ВООБЩЕ СПОСОБЕН ОБНАРУЖИТЬ")
+    print("=" * 96)
+    print("MDE — разрешающая способность, а не точность. Если |IC| меньше MDE,")
+    print("ячейка «не значим» означает «силы меньше разрешающей способности")
+    print("теста», а не «силы нет». Практический ориентир для дневных факторов:")
+    print("торгуемый IC держится в зоне 0.02–0.05.")
+    print("Разброс внутри горизонта — из-за разной автокорреляции рядов у разных")
+    print("предикторов: N_eff считается по каждому ряду отдельно.\n")
+    print(f"{'h':>4}{'N_eff':>20}{'MDE':>18}{'× к IC 0.05':>18}")
+    print("-" * 60)
+    lo_all, hi_all = [], []
+    for h in sorted(df["horizon"].unique()):
+        ns = [v[2] for (p, hh), v in verdicts.items() if hh == h]
+        if not ns:
+            continue
+        n_best, n_worst = max(ns), min(ns)
+        d_best, d_worst = mde(n_best), mde(n_worst)
+        lo_all.append(d_best)
+        hi_all.append(d_worst)
+        print(f"{h:>4}{f'{n_best:.1f} … {n_worst:.1f}':>20}"
+              f"{f'{d_best:.3f} … {d_worst:.3f}':>18}"
+              f"{f'{d_worst / 0.05:.1f}…{d_best / 0.05:.1f}x':>18}")
+    print()
+    print(f"Лучшая ячейка проекта: MDE = {min(lo_all):.3f}")
+    print(f"Худшая ячейка проекта: MDE = {max(hi_all):.3f}")
+    print(f"Ориентир торгуемого IC = 0.05. Тест хуже него в "
+          f"{min(lo_all) / 0.05:.1f}…{max(hi_all) / 0.05:.1f} раз — то есть")
+    print("область IC 0.02–0.05 для него принципиально недоступна.")
     return 0
 
 
