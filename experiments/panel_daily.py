@@ -262,6 +262,7 @@ def daily_ics(tables, ics, rng):
     dates = dates.sort_values()
 
     rows, counts = [], []
+    kept = []
     for d in dates:
         real = realized.loc[d].dropna()
         names = real.index
@@ -286,8 +287,12 @@ def daily_ics(tables, ics, rng):
             row["ctrl"] = np.nan
         rows.append(row)
         counts.append(cnt)
-    ic_df = pd.DataFrame(rows, index=dates, columns=PREDICTORS + ["ctrl"])
-    counts = pd.Series(counts, index=dates, name="n_names")
+        kept.append(d)
+    # kept, а не dates: даты с <3 бумагами были пропущены continue-ом —
+    # стройка DataFrame по dates расходилась по длине (полном прогон, 13
+    # тикеров, 3341 против 3235) и падала с ValueError.
+    ic_df = pd.DataFrame(rows, index=kept, columns=PREDICTORS + ["ctrl"])
+    counts = pd.Series(counts, index=kept, name="n_names")
     return ic_df.dropna(how="all"), counts.reindex(ic_df.index)
 
 
