@@ -73,11 +73,18 @@ def available_n(bars, horizon, stride=None):
     return max(bars // stride, 1)
 
 
-def mde_for(n, alpha=ALPHA):
-    """Минимальный обнаружимый |rho| при данном n."""
+def mde_for(n, alpha=ALPHA, power=POWER):
+    """Минимальный обнаружимый |rho| при данном n.
+
+    ВАЖНО:.power здесь обязателен. Раньше порог считался только по
+    z_{1-α/2}, то есть соответствовал мощности 50 %, тогда как required_n
+    считался при 80 % (z_{1-α/2}+z_{0.80}). Одна и та же величина была
+    описана двумя стандартами, и в отчёте это читалось как противоречие
+    (audit 2026-10-25, MB2). Теперь обе функции используют одну конвенцию.
+    """
     if n <= 3:
         return float("nan")
-    z = ND.inv_cdf(1 - alpha / 2)
+    z = ND.inv_cdf(1 - alpha / 2) + ND.inv_cdf(power)
     return math.tanh(z / math.sqrt(n - 3))
 
 

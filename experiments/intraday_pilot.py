@@ -251,19 +251,32 @@ def icc_within_day(rows):
         return np.nan, np.nan, 0
     m = float(np.mean([len(v) for v in days]))
     grand = float(np.mean([x for v in days for x in v]))
-    msb = len(days) * m * float(np.mean([(np.mean(v) - grand) ** 2 for v in days]))
+    # MSB — СРЕДНЕЕ квадратов между днями, а не их сумма: SSB делится на
+    # (число дней − 1). Без этого деления MSB завышается в n/(n−1) раз
+    # (для 27 суток — на 3.8 %), а с ним и ICC (audit 2026-10-25, m5 + MB5).
+    ssb = len(days) * m * float(np.mean([(np.mean(v) - grand) ** 2 for v in days]))
+    msb = ssb / (len(days) - 1)
     msw = float(np.mean([np.var(v, ddof=1) for v in days if len(v) > 1]))
     if msw <= 0:
         return 0.0, m, len(days)
-    k0 = m - 1 - (msb / msw)
-    icc = max(0.0, msb / (msb + (m - 1) * msw)) if (msb + (m - 1) * msw) > 0 else 0.0
+    # ICC (one-way random effects): (MSB − MSW) / (MSB + (m−1)·MSW).
+    # Раньше стояло MSB / (MSB + (m−1)·MSW) — без вычитания MSW, что
+    # соответствует другой конвенции и завышает ICC.
+    denom = msb + (m - 1) * msw
+    icc = max(0.0, (msb - msw) / denom) if denom > 0 else 0.0
     return icc, m, len(days)
 
 
-def mde(n_eff, alpha=0.05):
+def mde(n_eff, alpha=0.05, power=0.80):
+    """Минимальный обнаружимый |rho| при заданной эффективной выборке.
+
+    power по умолчанию 0.80 — та же конвенция, что в power_analysis.py.
+    Раньше порог считался только по z_{1-α/2}, то есть соответствовал
+    мощности 50 %, и занижал MDE почти вдвое (audit 2026-10-25, MB2).
+    """
     if n_eff <= 3:
         return float("nan")
-    z = ND.inv_cdf(1 - alpha / 2)
+    z = ND.inv_cdf(1 - alpha / 2) + ND.inv_cdf(power)
     return float(np.tanh(z / np.sqrt(n_eff - 3)))
 
 
@@ -435,10 +448,16 @@ def main():
         print(f"{h:>4}{h * 5 / 60:>7.1f}ч{icc:>8.3f}{deff:>8.2f}{d:>11.3f}"
               f"{n_long:>15,.0f}{mde(n_long):>13.4f}")
     print()
-    print("Итог: ICC окон внутри дня 0.69–0.93 — это не шум, а общее рыночное")
-    print("состояние дня. Кластеризация съедает номинальную выборку в 4–22 раза,")
-    print("и 12 лет истории всё равно выводят на MDE 0.027–0.031 — зона IC 0.03,")
-    print("а не 0.02. Обрезка по громкому окну этого НЕ чинит (см. выше).")
+    iccs = [r[2] for r in results if np.isfinite(r[2])]
+    deffs = [r[3] for r in results if np.isfinite(r[3])]
+    mde12 = [mde(r[5] * 144) for r in results if np.isfinite(r[5])]
+    if iccs and mde12:
+        print(f"Итог: ICC окон внутри дня {min(iccs):.3f}–{max(iccs):.3f} — "
+              f"кластеризация слабая;")
+        print(f"она съедает номинальную выборку в {min(deffs):.1f}–{max(deffs):.1f} раз, "
+              f"и 12 лет истории")
+        print(f"выводят на MDE {min(mde12):.4f}–{max(mde12):.4f} — зона IC ~0.01.")
+    print("Обрезка по громкому окну этого НЕ чинит (см. выше).")
     print()
     print("Честные оговорки:")
     print("  * предиктор здесь z-скор цены — он сам по себе инерционный внутри")

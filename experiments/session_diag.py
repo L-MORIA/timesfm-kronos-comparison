@@ -75,15 +75,24 @@ def main():
 
     med = float(h.median())
     above = h[h >= med]
-    quiet = h[h.index > above.index.max()]
+    # Тихий хвост — ДВУСТОРОННИЙ: и предторговый блок ДО первого громкого,
+    # и хвост ПОСЛЕ последнего. Раньше брался только хвост после, из-за чего
+    # утренний предторговый блок попадал в «громкую» часть и доля объёма
+    # в громком окне завышалась (audit 2026-10-25, m7).
+    head = h[h.index < above.index.min()]
+    tail = h[h.index > above.index.max()]
+    quiet = pd.concat([head, tail]) if len(head) else tail
     loud_share = 1 - float(quiet.sum()) / float(h.sum())
 
     print()
     print(f"медиана объёма            : {med:,.0f}")
     print(f"громкий блок (>= медианы) : {str(above.index.min())[11:16]} … "
           f"{str(above.index.max())[11:16]}")
-    print(f"тихий хвост после него    : {str(quiet.index.min())[11:16]} … "
-          f"{str(quiet.index.max())[11:16]}")
+    if len(head):
+        print(f"тихий хвост ДО него       : {str(head.index.min())[11:16]} … "
+              f"{str(head.index.max())[11:16]}")
+    print(f"тихий хвост ПОСЛЕ него    : {str(tail.index.min())[11:16]} … "
+          f"{str(tail.index.max())[11:16]}")
     print(f"доля объёма в громкой части: {loud_share * 100:.1f} %")
     print()
 

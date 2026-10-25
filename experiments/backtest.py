@@ -228,7 +228,13 @@ def run(args):
                     continue
                 torch.manual_seed(_seed_for(ticker, T.date(), h))
                 try:
-                    kout = m.kronos_predict(kp, win, min(h, m.KRONOS_MAX_PRED_LEN), weekend)
+                    # Реальные даты будущих баров: в бэктесте календарь известен,
+                    # и календарная аппроксимация future_bars() сдвигает метки
+                    # времени Kronos на 2–6 дней (audit 2026-10-25, M1).
+                    kout = m.kronos_predict(
+                        kp, win, min(h, m.KRONOS_MAX_PRED_LEN), weekend,
+                        y_ts_override=df["begin"].iloc[i + 1: i + 1 + h].values,
+                    )
                 except Exception as e:                       # noqa: BLE001
                     print(f"  [{T.date()} h={h}] Kronos сбой: {e}")
                     kout = None

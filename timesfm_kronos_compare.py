@@ -404,10 +404,20 @@ def future_bars(last_ts, n, trades_weekends):
     return pd.Series(pd.date_range(start=start, periods=n, freq=freq))
 
 
-def kronos_predict(predictor, df_full, pred_len, trades_weekends):
-    """Run Kronos prediction. Returns array of predicted close prices."""
+def kronos_predict(predictor, df_full, pred_len, trades_weekends, y_ts_override=None):
+    """Run Kronos prediction. Returns array of predicted close prices.
+
+    y_ts_override — реальные даты будущих баров, если они известны (в
+    бэктесте — да, в проде — нет). Без них используется календарная
+    аппроксимация future_bars(), которая не совпадает с реальным
+    торговым календарём MOEX: 90 торговых баров занимают 96 календарных
+    дней, а метки дают 90 (audit 2026-10-25, M1).
+    """
     x_ts = pd.Series(df_full["begin"].values)
-    y_ts_future = future_bars(df_full["begin"].iloc[-1], pred_len, trades_weekends)
+    if y_ts_override is not None:
+        y_ts_future = pd.Series(pd.DatetimeIndex(y_ts_override))
+    else:
+        y_ts_future = future_bars(df_full["begin"].iloc[-1], pred_len, trades_weekends)
 
     try:
         pred_df = predictor.predict(
