@@ -94,8 +94,8 @@ check("sigma=0 -> None", m.reversion_excess(90.0, 80.0, 0.0, LM, 30), None)
 print("=== render_diagnostics ===")
 diag = m.render_diagnostics([{"ticker": "T", "horizon": 30,
                               "kronos_excess": 0.21, "timesfm_excess": 1.52}])
-check("Kronos помечен как откат", "откат к среднему" in diag, True)
-check("TimesFM помечен как свой сигнал", "собственный сигнал" in diag, True)
+check("Kronos помечен как повтор отката", "повторяет откат" in diag, True)
+check("TimesFM помечен как отличие от отката", "отличается от отката" in diag, True)
 
 print("=== future_bars: календарь из данных (audit C3) ===")
 fri = pd.Timestamp("2026-10-16")
@@ -207,6 +207,105 @@ with tempfile.TemporaryDirectory() as td:
     m.save_chart({}, 30, out_path=png)
     check("файл не создан", os.path.exists(png), False)
 
+print("=== сетевой слой: ретраи, пагинация, схема (audit 2026-10-25 m8) ===")
+import datetime
+from unittest import mock
+
+_MOEX_COLS = ["open", "high", "low", "close", "value", "volume", "begin", "end", "interval"]
+
+
+class _FakeResp:
+    def __init__(self, payload=None, boom=False):
+        self._payload = payload
+        self._boom = boom
+
+    def raise_for_status(self):
+        if self._boom:
+            raise RuntimeError("HTTP 404")
+
+    def json(self):
+        return self._payload
+
+
+# _moex_json: успех со второй попытки
+_attempts = {"n": 0}
+
+
+def _flaky_get(*a, **kw):
+    _attempts["n"] += 1
+    if _attempts["n"] == 1:
+        return _FakeResp(boom=True)
+    return _FakeResp({"ok": True})
+
+
+_attempts["n"] = 0
+with mock.patch.object(m.requests, "get", _flaky_get), \
+     mock.patch.object(m.time, "sleep", lambda s: None):
+    res = m._moex_json("http://x", {}, "TICK")
+check("ретрай: успех со 2-й попытки", res, {"ok": True})
+check("ретрай: ровно 2 попытки", _attempts["n"], 2)
+
+# _moex_json: все попытки провалились -> None
+_attempts["n"] = 0
+
+
+def _always_boom(*a, **kw):
+    _attempts["n"] += 1
+    return _FakeResp(boom=True)
+
+
+with mock.patch.object(m.requests, "get", _always_boom), \
+     mock.patch.object(m.time, "sleep", lambda s: None):
+    res = m._moex_json("http://x", {}, "TICK")
+check("ретрай: исчерпание попыток -> None", res, None)
+check("ретрай: попыток = MOEX_ATTEMPTS", _attempts["n"], m.MOEX_ATTEMPTS)
+
+
+# fetch_moex_candles: пагинация из нескольких страниц
+def _make_rows(n, start_day=0):
+    base = datetime.date(2024, 1, 1) + datetime.timedelta(days=start_day)
+    return [[100.0, 101.0, 99.0, 100.5, 1e6, 1000.0,
+             f"{base + datetime.timedelta(days=i)} 00:00:00",
+             f"{base + datetime.timedelta(days=i)} 23:59:00", 24]
+            for i in range(n)]
+
+
+_total = 1200
+_pages = {"n": 0}
+
+
+def _fake_moex(url, params, ticker):
+    _pages["n"] += 1
+    start = params.get("start", 0)
+    if start >= _total:
+        return {"candles": {"columns": _MOEX_COLS, "data": []}}
+    chunk = _make_rows(min(m.MOEX_PAGE_LIMIT, _total - start), start)
+    return {"candles": {"columns": _MOEX_COLS, "data": chunk}}
+
+
+_pages["n"] = 0
+with mock.patch.object(m, "_moex_json", _fake_moex):
+    df = m.fetch_moex_candles("TICK")
+check("пагинация: собраны все бары", 0 if df is None else len(df), _total)
+check("пагинация: страниц = ceil(N/limit)", _pages["n"],
+      -(-_total // m.MOEX_PAGE_LIMIT))
+check("пагинация: value переименован в amount", "amount" in df.columns, True)
+check("пагинация: нет дублей дат", int(df["begin"].duplicated().sum()), 0)
+check("пагинация: бары отсортированы", bool(df["begin"].is_monotonic_increasing), True)
+
+# fetch_moex_candles: MOEX недоступен -> None
+with mock.patch.object(m, "_moex_json", lambda *a, **kw: None):
+    check("пагинация: MOEX недоступен -> None", m.fetch_moex_candles("TICK"), None)
+
+# normalize_candles: неожиданная схема -> None (не пустой DataFrame)
+# убираем колонку value ИЗ ДАННЫХ, чтобы число колонок совпадало с числом имён
+_bad_rows = [[r[0], r[1], r[2], r[3], r[5], r[6], r[7], r[8]] for r in _make_rows(3)]
+_bad = pd.DataFrame(_bad_rows, columns=[c for c in _MOEX_COLS if c != "value"])
+check("схема: нет колонки value -> None", m.normalize_candles(_bad, "TICK"), None)
+_up = pd.DataFrame(_make_rows(3), columns=[c.upper() for c in _MOEX_COLS])
+check("схема: верхний регистр колонок -> ok",
+      m.normalize_candles(_up, "TICK") is not None, True)
+
 if "--live" in sys.argv:
     print("=== MOEX ISS: дневные бары, оборот, статистики окна (audit H3) ===")
     for ticker in m.TICKERS:
@@ -232,11 +331,22 @@ if "--live" in sys.argv:
               f"{'D' if wknd else 'B'})")
         check(f"{ticker}: sigma_d > 0", sd > 0, True)
         check(f"{ticker}: 0 < mean <= max", 0 < mean <= df["close"].max(), True)
-        # Дрейф календаря недопустим: N баров == N дней назад
+        # Реальный календарный охват N торговых баров против меток future_bars.
+        # Прежняя проверка (abs(drift - n) <= 2) была ТАВТОЛОГИЕЙ: future_bars
+        # при freq='D' всегда возвращает ровно N календарных дней, то есть
+        # проверяла саму себя и не ловила расхождение между барами и календарём
+        # (audit 2026-10-25, M1).
         n = 90
-        fb = m.future_bars(df["begin"].iloc[-1], n, wknd)
-        drift = (fb.iloc[-1] - df["begin"].iloc[-1]).days
-        check(f"{ticker}: {n} баров ≈ {n} дней (дрейф={drift})", abs(drift - n) <= 2, True)
+        if len(df) > n:
+            real_span = (df["begin"].iloc[-1] - df["begin"].iloc[-n - 1]).days
+            fb = m.future_bars(df["begin"].iloc[-1], n, wknd)
+            label_span = (fb.iloc[-1] - df["begin"].iloc[-1]).days
+            # Инвариант: N торговых баров не могут занимать меньше N дней.
+            check(f"{ticker}: {n} торговых баров >= {n} календарных дней",
+                  real_span >= n, True)
+            print(f"         {n} торговых баров = {real_span} календарных дней; "
+                  f"future_bars(freq={'D' if wknd else 'B'}) подписывает "
+                  f"{label_span} дней (разница {real_span - label_span})")
 
 print()
 if failures:

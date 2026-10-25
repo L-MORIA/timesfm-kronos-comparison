@@ -43,6 +43,7 @@ import importlib.util
 import os
 import sys
 import time
+import zlib
 from datetime import datetime, timezone
 
 import numpy as np
@@ -64,9 +65,25 @@ r = _load("r", os.path.join(ROOT, "experiments", "data_recon.py"))
 WINDOW_BARS = 112            # столько баров видит модель (≈HISTORY_DAYS)
 FROM_DATE = "2021-01-01"
 # Закрытие рынка 2022-02-25 .. 2022-03-24: горизонт через него не
-# интерпретируется (audit, этап 1).
+# интерпретируется (audit, этап 1). Исключаем ВСЁ окно до 2022-05-25 —
+# не только сам разрыв, но и бары после него, пока не наберётся 60 баров
+# истории (иначе ранние окна не восстанавливаются).
 EXCLUDE = [("2022-02-25", "2022-05-25")]
+GAP_MAX_DAYS = 7             # разрыв в торгах длиннее — горизонт «перепрыгивает»
 OUT_CSV = os.path.join(ROOT, "logs", "backtest_observations.csv")
+
+
+def _seed_for(ticker, date, h) -> int:
+    """Детерминированный seed НА ТОЧКУ.
+
+    Раньше seed переустанавливался на одно и то же значение перед каждой
+    точкой, поэтому шум сэмплирования Kronos был ОДИНАКОВЫМ во всех 435
+    наблюдениях, а для одной даты шумовые компоненты на h=30/60/90 были
+    коррелированы на 1.0 (audit 2026-10-25, m9). Теперь seed зависит от
+    (тикер, дата, горизонт) — розыгрыш разный, но воспроизводимый, поэтому
+    --resume по-прежнему даёт те же числа.
+    """
+    return (m.SEED + zlib.crc32(f"{ticker}|{date}|{h}".encode("utf-8"))) % (2 ** 31)
 
 
 def excluded(date) -> bool:
@@ -161,6 +178,7 @@ def run(args):
     print(f"[INIT] готово за {time.time() - t0:.1f} с\n")
 
     t_start = time.time()
+    n_gap_skipped = 0
 
     for ticker in args.tickers:
         print(f"{'='*78}\n{ticker}")
@@ -174,6 +192,11 @@ def run(args):
         if df is None:
             continue
         df = df[df["begin"] >= pd.Timestamp("2019-01-01")].reset_index(drop=True)
+
+        # Разрывы в торгах: горизонт, перекрывающий длинный разрыв, не
+        # интерпретируется (апрель 2022 — 27 календарных дней без торгов).
+        # Такие точки исключаем целиком, а не оставляем NaN в realized.
+        gaps = df["begin"].diff().dt.days.fillna(0).to_numpy()
 
         idxs = test_dates(df, args.step, horizons)
         idxs = [i for i in idxs if df["begin"].iloc[i] >= pd.Timestamp(FROM_DATE)]
@@ -199,7 +222,11 @@ def run(args):
             vals = win["close"].values.astype(np.float32)
 
             for h in horizons:
-                torch.manual_seed(m.SEED)
+                seg = gaps[i + 1: i + h + 1]
+                if len(seg) and float(seg.max()) > GAP_MAX_DAYS:
+                    n_gap_skipped += 1
+                    continue
+                torch.manual_seed(_seed_for(ticker, T.date(), h))
                 try:
                     kout = m.kronos_predict(kp, win, min(h, m.KRONOS_MAX_PRED_LEN), weekend)
                 except Exception as e:                       # noqa: BLE001
@@ -215,7 +242,13 @@ def run(args):
                 t_pred = float(tout[-1]) if tout is not None else np.nan
                 k_ret = (k_pred / last - 1) * 100 if np.isfinite(k_pred) else np.nan
                 t_ret = (t_pred / last - 1) * 100 if np.isfinite(t_pred) else np.nan
-                ens = np.nanmean([k_ret, t_ret]) if np.isfinite(k_ret + t_ret) else np.nan
+                # isfinite проверяем по КАЖДОМУ значению, а не по их сумме:
+                # k=+inf и t=-inf дают NaN в сумме, и оба ответа терялись бы
+                # (audit 2026-10-25, m5).
+                if np.isfinite(k_ret) and np.isfinite(t_ret):
+                    ens = float(np.nanmean([k_ret, t_ret]))
+                else:
+                    ens = np.nan
 
                 realized = (df["close"].iloc[i + h] / last - 1) * 100
                 span = (df["begin"].iloc[i + h] - T).days
@@ -250,6 +283,9 @@ def run(args):
     total = time.time() - t_start
     print(f"\n{'='*78}")
     print(f"Наблюдений: {len(out)}   Время: {total/60:.1f} мин")
+    if n_gap_skipped:
+        print(f"Пропущено точек с горизонтом через длинный разрыв торгов: "
+              f"{n_gap_skipped}")
     print(f"Сохранено: {OUT_CSV}")
     return out
 

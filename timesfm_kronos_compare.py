@@ -144,7 +144,10 @@ _pin_threads()
 # ── Конфигурация ──────────────────────────────────────────────
 INTERVAL = 24                 # MOEX ISS: 24 = дневные бары (audit C1)
 FREQ = "B"                    # business days для будущих таймстемпов
-HISTORY_DAYS = 120            # ~82 торговых бара; хватает для горизонта 90
+HISTORY_DAYS = 120            # календарных дней: ~113 баров (7 дней/нед. с 2025-03),
+                              # но ~86 в режиме «только будни» — этого МЕНЬШЕ
+                              # горизонта 90, контекст модели будет короче
+                              # прогноза (audit 2026-10-25, m7)
 MIN_BARS = 30                 # меньше — прогноз недостоверен
 BOARD = "TQBR"                # MOEX base board for all tickers below
 TICKERS = ["SBERP", "GAZP", "LKOH"]  # Сбер преф, Газпром, Лукойл
@@ -453,8 +456,11 @@ def load_timesfm():
     config = ForecastConfig(max_context=512, max_horizon=TIMESFM_MAX_HORIZON)
     LOG.info("[TimesFM] Compiling...")
     model.compile(config)
-    LOG.info("[TimesFM] Ready (device=%s)!",
-             ("cuda" if torch.cuda.is_available() and TFKC_DEVICE != "cpu" else "cpu"))
+    # Устройство — из resolve_device(), а не отдельной строкой: иначе два
+    # источника истины, и при TFKC_DEVICE="cuda" без доступной CUDA диагностика
+    # написала бы "cpu", хотя resolve_device() бросил бы исключение
+    # (audit 2026-10-25, m3).
+    LOG.info("[TimesFM] Ready (device=%s)!", resolve_device())
     return model
 
 
@@ -497,6 +503,11 @@ def compute_signal(pred_price, last_price, sigma_d=None, horizon=None):
         if z <= -Z_THRESHOLD:
             return "ПРОДАЖА", chg, z
         return "ДЕРЖАТЬ", chg, z
+    # Смена режима порога (z → абсолютный) не должна проходить молча
+    # (audit 2026-10-25, m2).
+    if sigma_d is not None and horizon and sigma_d <= 0:
+        LOG.warning("  σ_дн = 0 — порог z-режима недостижим, использую "
+                    "абсолютный порог ±%.1f%% (режим сменился)", ABS_THRESHOLD)
     if chg >= ABS_THRESHOLD:
         return "ПОКУПКА", chg, None
     if chg <= -ABS_THRESHOLD:
@@ -614,6 +625,12 @@ def render_diagnostics(results):
 
     z_excess ≈ 0 означает, что модель повторила арифметику окна (среднее) и
     не сказала ничего сверх неё.
+
+    ВЕРДИКТ ЗДЕСЬ И В ТАБЛИЦЕ — РАЗНЫЕ ВЕЛИЧИНЫ: здесь z_excess (насколько
+    прогноз отличается от среднего), в таблице z (насколько прогноз отличается
+    от текущей цены). Раньше здесь писалось «собственный сигнал», и это
+    читалось как «модель дала сигнал», хотя торговый вердикт мог быть
+    «ДЕРЖАТЬ» (audit 2026-10-25, m1).
     """
     lines = ["Модель              тикер   h    z_excess   вердикт",
              "-" * 58]
@@ -622,8 +639,8 @@ def render_diagnostics(results):
             ze = r.get(f"{model}_excess")
             if ze is None:
                 continue
-            verdict = ("откат к среднему" if abs(ze) < Z_THRESHOLD
-                       else "собственный сигнал")
+            verdict = ("повторяет откат" if abs(ze) < Z_THRESHOLD
+                       else "отличается от отката")
             lines.append(f"{model:<18}{r['ticker']:>7}{r['horizon']:>5}"
                          f"{ze:>11.2f}   {verdict}")
     return "\n".join(lines)
@@ -699,6 +716,19 @@ def _ticker_context(df):
     LOG.info("  Trading calendar: %s",
              "7 days/week (weekend sessions)" if trades_weekends else "Mon-Fri only")
     LOG.info("  Window: mean=%.2f sigma_d=%.2f%%/day", mean_price, sigma_d * 100)
+    if len(df) < max(HORIZONS):
+        LOG.warning("  баров %d < горизонта %d — контекст модели короче "
+                    "прогноза, качество на длинных горизонтах падает",
+                    len(df), max(HORIZONS))
+
+    # Сколько КАЛЕНДАРНЫХ дней занимает один торговый бар: MOEX не торгует
+    # в выходные без сессий и в праздники, поэтому N баров ≠ N календарных
+    # дней (на 2026-10 разница доходила до 6 дней на горизонте 90).
+    # future_bars() по-прежнему строит календарные метки, но подпись должна
+    # говорить правду (audit 2026-10-25, M1).
+    win = df.tail(250)
+    span_days = (win["begin"].iloc[-1] - win["begin"].iloc[0]).days
+    bar_days = span_days / max(len(win) - 1, 1)
 
     return {
         "df": df,
@@ -708,6 +738,7 @@ def _ticker_context(df):
         "sigma_d": sigma_d,
         "last_date": last_date,
         "trades_weekends": trades_weekends,
+        "bar_days": bar_days,
     }
 
 
@@ -728,9 +759,13 @@ def _forecast_horizon(ticker, horizon, ctx, kronos_predictor, timesfm_model,
     # магическому порогу (audit M2).
     kronos_bars = min(horizon, KRONOS_MAX_PRED_LEN)
     capped = kronos_bars < horizon
+    cal_days = int(round(kronos_bars * ctx.get("bar_days", 1.0)))
     LOG.info("  [Kronos] Predicting %d bars ahead%s", kronos_bars,
              (f" (запрошено {horizon}d, cap={KRONOS_MAX_PRED_LEN})"
               if capped else "..."))
+    LOG.info("    горизонт %d баров ≈ %d календарных дней "
+             "(MOEX не торгует в выходные без сессий)",
+             kronos_bars, cal_days)
     kronos_preds = kronos_predict(kronos_predictor, ctx["df"], kronos_bars,
                                   ctx["trades_weekends"])
 
@@ -902,14 +937,21 @@ def main():
     LOG.info("=" * 80)
     LOG.info("%s", diagnostics)
 
+    # ── Save results to log file ───────────────────────────────
+    # СНАЧАЛА отчёт, потом график: падение графика (например, ValueError при
+    # рассинхроне дат и точек) не должно съедать текстовый отчёт прогона —
+    # это самый ценный артефакт (audit 2026-10-25, m4).
+    log_path = _write_report(now_str, tables, interpretation, diagnostics)
+    LOG.info("Log saved: %s", log_path)
+
     # ── Save chart (первый горизонт) ───────────────────────────
     LOG.info("\n%s", "=" * 80)
     LOG.info("Saving charts...")
-    save_chart(chart_data, HORIZONS[0])
-
-    # ── Save results to log file ───────────────────────────────
-    log_path = _write_report(now_str, tables, interpretation, diagnostics)
-    LOG.info("Log saved: %s", log_path)
+    try:
+        save_chart(chart_data, HORIZONS[0])
+    except Exception as e:                                   # noqa: BLE001
+        LOG.warning("График не построен: %s: %s — отчёт уже сохранён",
+                    type(e).__name__, e)
 
 
 def save_chart(chart_data, horizon, out_path=None):

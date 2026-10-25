@@ -69,6 +69,8 @@ IC_CSV = os.path.join(ROOT, "logs", "panel_daily_ic.csv")
 LOOKBACK_W = 60                     # окно среднего/σ для отката к среднему
 K = 4                               # размер портфеля top-K
 COMMISSION_BPS = 3.0                # за сторону; тариф розницы, не из баров
+IC_ACCEPT = 0.05                    # предрегистрированный критерий приёмки (ROADMAP.md:552)
+GAP_MAX_DAYS = 7                    # разрыв в торгах длиннее — realized покрывает не h=1
 
 
 def load_master():
@@ -178,6 +180,18 @@ def predictor_table(close: pd.Series) -> pd.DataFrame:
     })
     out["close"] = c
     out["realized"] = c.shift(-1) / c - 1.0                     # h = 1 день
+    # При длинном разрыве в торгах (2022-02-25 → 2022-03-24) realized покрывает
+    # не 1 день, а весь разрыв (19 торговых дней). Такую дату исключаем, иначе
+    # «h = 1» нарушается один раз (audit 2026-10-25, m2).
+    #
+    # ВАЖНО: gaps[d] — это разрыв ОТ предыдущей даты до d, а realized[d]
+    # покрывает период (d, next(d)]. Поэтому разрыв внутри этого периода —
+    # это gaps[next(d)] = gaps.shift(-1)[d]. Без сдвига исключалась бы дата
+    # ПОСЛЕ разрыва вместо даты перед ним.
+    gaps = pd.Series(out.index, index=out.index).diff().dt.days
+    wide = gaps.shift(-1) > GAP_MAX_DAYS
+    if bool(wide.fillna(False).any()):
+        out.loc[wide.fillna(False), "realized"] = np.nan
     return out
 
 
@@ -198,6 +212,16 @@ def load_panel(args, m):
     want = args.tickers
     missing = [t for t in want if t not in cached]
     start_from = args.start or FROM
+    if args.start and cached:
+        # --start обязан ограничивать и закэшированные тикеры, иначе «bounded»
+        # прогон на заполненном кэше всё равно считает всю историю
+        # (audit 2026-10-25, m5).
+        cut = pd.Timestamp(args.start)
+        n_before = sum(len(f) for f in frames)
+        frames = [f[f["begin"] >= cut] for f in frames]
+        frames = [f for f in frames if len(f)]
+        n_after = sum(len(f) for f in frames)
+        print(f"[срез] --start {args.start}: кэш {n_before:,} → {n_after:,} баров")
     if missing and not args.offline:
         print(f"[сеть] догрузка: {', '.join(missing)}")
         for tk in missing:
@@ -309,18 +333,38 @@ def summarize_ic(ics, ic_series, n_dates_full, label):
     if n < 10:
         return None
     mean_ic = float(s.mean())
+    sd_ic = float(s.std(ddof=1))              # σ ряда дневных IC (не 1!)
     series = s.values - mean_ic                  # dc: acf_sum сам не вычитает
     s_sum = ics.acf_sum(series, 10)
     factor = max(1.0 + 2.0 * s_sum, 1e-6)
     n_eff = min(n / factor, float(n))
-    t_eff = mean_ic * np.sqrt(n_eff)
-    mde_half = 2.0 / np.sqrt(n_eff)              # граница значимости (power ~50%)
-    mde_p80 = 2.801585 / np.sqrt(n_eff)          # порог при power 0.80
+    # t-статистика: mean / (σ/√N). Раньше здесь было mean·√N_eff — это критерий
+    # для ряда с ЕДИНИЧНОЙ дисперсией, применённый к сырому IC-ряду с σ≈0.36.
+    # Из-за этого |t_eff| никогда не доходил до 2.50, и вердикт «не значим» был
+    # верен только по неверно масштабированному порогу (audit 2026-10-25, C1).
+    t_eff = mean_ic / (sd_ic / np.sqrt(n_eff)) if sd_ic > 0 else float("nan")
+    # MDE в единицах IC: порог для СРЕДНЕГО, умноженный на σ ряда.
+    # 2.80/√N_eff — это порог для среднего при σ=1; для IC нужен σ_IC (audit, C2).
+    mde_half = 2.0 * sd_ic / np.sqrt(n_eff)       # граница значимости (power ~50%)
+    mde_p80 = 2.801585 * sd_ic / np.sqrt(n_eff)   # порог при power 0.80
     z_bonf = ND.inv_cdf(1 - 0.05 / (2 * 4))      # α/4 предиктора, двусторонний
-    verdict = ("значим" if abs(t_eff) >= z_bonf else "не значим")
+    # Критерий приёмки по предрегистрации (ROADMAP.md:552): |IC| >= 0.05.
+    # Значимость — отдельное, дополнительное условие (audit 2026-10-25, M2):
+    # раньше вердикт проверял ТОЛЬКО t_eff, то есть критерий ≠ предрегистрации.
+    ic_ok = abs(mean_ic) >= IC_ACCEPT
+    sig_ok = abs(t_eff) >= z_bonf
+    if ic_ok and sig_ok:
+        verdict = "ПРОШЁЛ"
+    elif sig_ok:
+        verdict = "ниже пор."      # статистически значим, но эффект < IC_ACCEPT
+    elif ic_ok:
+        verdict = "мало данных"    # эффект есть, но не подтверждён значимостью
+    else:
+        verdict = "не значим"
     return {"label": label, "pred": ic_series.name, "n": n,
             "n_nominal": n_dates_full, "n_eff": n_eff, "ic": mean_ic,
-            "t_eff": t_eff, "mde_half": mde_half, "mde_p80": mde_p80,
+            "sd_ic": sd_ic, "t_eff": t_eff, "mde_half": mde_half,
+            "mde_p80": mde_p80, "ic_ok": ic_ok, "sig_ok": sig_ok,
             "verdict": verdict}
 
 
@@ -350,6 +394,12 @@ def portfolio_turnover(tables, k=K):
     портфеля (prev). Календарная арифметика (BDay(1)) не годится: с 2025-03
     торги семь дней в неделю, а приостановки реальны. Поэтому prev — это
     последняя успешно собранная корзина, а не «вчерашняя по календарю».
+
+    ВНИМАНИЕ: из-за этого портфель торгуется с задержкой в один бар — корзина,
+    собранная на T, приносит доходность с T+1 (close_{T+1}/close_{T+2}), а не
+    с T. Это консервативно (утечки нет), но означает, что «валовая доходность»
+    в отчёте — доходность портфеля, собранного на предыдущей дате
+    (audit 2026-10-25, m1).
     """
     preds = {p: pd.DataFrame({t: tables[t][p] for t in tables})
              for p in PREDICTORS}
@@ -396,9 +446,10 @@ def main():
     print("ШАГ 1: ДНЕВНАЯ КРОСС-СЕКЦИОННАЯ ПАНЕЛЬ, h=1 — есть ли предиктор?")
     print("=" * 96)
     print(f"тикеры        : {', '.join(args.tickers)}")
-    print(f"окно отката   : {LOOKBACK_W} баров;  портфель top-{K} из 13")
-    print(f"приёмка       : IC >= 0.05 при power 0.80 (= |t_eff| >= "
-          f"{ND.inv_cdf(1 - 0.05 / (2 * 4)):.2f}, Bonferroni α/4)")
+    print(f"окно отката   : {LOOKBACK_W} баров;  портфель top-{K} из {len(args.tickers)}")
+    print(f"приёмка       : |IC| >= {IC_ACCEPT} (предрегистрация, ROADMAP.md:552) "
+          f"+ значимость |t| >= {ND.inv_cdf(1 - 0.05 / (2 * 4)):.2f} (Bonferroni α/4)")
+    print("                 t = mean_IC / (σ_IC/√N_eff); MDE .80 — порог по IC при power 0.80")
     print()
 
     tables = load_panel(args, m)
@@ -445,17 +496,21 @@ def main():
                 rows.append(r)
 
     hdr = (f"{'окно':<20}{'предиктор':<17}{'N':>6}{'N_eff':>7}"
-           f"{'IC':>8}{'t_eff':>7}{'MDE .50':>9}{'MDE .80':>9}{'вердикт':>10}")
+           f"{'IC':>8}{'σ_IC':>7}{'t':>7}{'MDE .50':>9}{'MDE .80':>9}{'вердикт':>11}")
     print(hdr)
     print("-" * len(hdr))
     for r in rows:
         print(f"{r['label']:<20}{r['pred']:<17}{r['n']:>6}{r['n_eff']:>7.0f}"
-              f"{r['ic']:>8.4f}{r['t_eff']:>7.2f}{r['mde_half']:>9.4f}"
-              f"{r['mde_p80']:>9.4f}{r['verdict']:>10}")
+              f"{r['ic']:>8.4f}{r['sd_ic']:>7.3f}{r['t_eff']:>7.2f}"
+              f"{r['mde_half']:>9.4f}"
+              f"{r['mde_p80']:>9.4f}{r['verdict']:>11}")
     print()
     print("N_eff — по автокорреляции IC-ряда (lags=10), ограничен сверху N.")
-    print("MDE .50 — граница значимости (2/√N_eff), MDE .80 — порог при")
-    print("power 0.80 (2.80/√N_eff). «Значим» — против порога Bonferroni 2.50.")
+    print("σ_IC — стандартное отклонение дневного IC. t = mean_IC/(σ_IC/√N_eff).")
+    print("MDE .50 / .80 — пороги по IC при power 0.50 / 0.80: (z·σ_IC)/√N_eff.")
+    print("Вердикт: «ПРОШЁЛ» = |IC| ≥ 0.05 И |t| ≥ 2.50; «ниже пор.» = значим, но")
+    print("эффект < 0.05 (предрегистрированного порога не достигли); «не значим» =")
+    print("и эффект мал, и значимости нет.")
     print()
 
     print("=" * 96)
@@ -478,7 +533,11 @@ def main():
     print("4. ИЗДЕРЖКИ: спред Roll по дневным барам + turnover top-4")
     print("=" * 96)
     spreads = {t: float(roll_spread_daily(tables[t]["close"])) for t in tables}
-    med = float(np.median([s for s in spreads.values() if np.isfinite(s)]))
+    finite = [s for s in spreads.values() if np.isfinite(s)]
+    med = float(np.median(finite))
+    n_zero = sum(1 for s in finite if s <= 0)
+    med_pos = (float(np.median([s for s in finite if s > 0])) if any(s > 0 for s in finite)
+               else float("nan"))
     for t in sorted(spreads):
         s = spreads.get(t)
         print(f"  {t:<7} Roll {10000 * s:>6.1f} бп" if np.isfinite(s)
@@ -492,6 +551,15 @@ def main():
     cost_rt = 10000 * med + 2 * COMMISSION_BPS
     print(f"  издержки на полный круг: {10000 * med:.1f} бп спред "
           f"+ {2 * COMMISSION_BPS:.1f} бп комиссия = {cost_rt:.1f} бп")
+    if n_zero:
+        alt = 10000 * med_pos + 2 * COMMISSION_BPS
+        print(f"  ВНИМАНИЕ: у {n_zero} из {len(finite)} тикеров Roll-оценка = 0")
+        print(f"  (ковariance ≥ 0, бид-аск не виден). Медиана по ненулевым:")
+        print(f"  {10000 * med_pos:.1f} бп → полный круг {alt:.1f} бп (на "
+              f"{alt - cost_rt:.1f} бп/день выше).")
+        print("  Оставляем медиану по всем (в т.ч. нули) — это МЕНЕЕ консервативная")
+        print("  оценка издержек, значит вывод «нетто отрицательно» от неё только")
+        print("  крепче. Чувствительность к нулевым оценкам приведена выше.")
     print()
 
     gross_raw, turn_raw = portfolio_turnover(tables, k=K)
@@ -522,28 +590,55 @@ def main():
     print()
     print("Нетто — валовая минус turnover × полный круг. «Валовая» — mean IC")
     print("не знает: это доходность портфеля, собранного вчера, а не IC.")
+    print("Порог, который валовая ДОЛЖНА преодолеть: turnover × полный круг,")
+    print(f"то есть {mean_to:.2f} × {cost_rt:.1f} = {mean_to * cost_rt:.1f} бп/день для")
+    print("этого предиктора — не сам полный круг.")
     print()
 
     print("=" * 96)
     print("ВЕРДИКТ ШАГА 1")
     print("=" * 96)
-    strong = [r for r in rows
-              if r["verdict"] == "значим" and r["pred"] != "ctrl"]
     main_rows = [r for r in rows if r["pred"] != "ctrl"]
     if not main_rows:
         print("  Расчёт не состоялся: ни одной даты с >=3 бумагами.")
         print("  Сузь окно или добавь тикеров — и запусти снова.")
         return 2
+    # Предрегистрация (ROADMAP.md:552): предиктор с |IC| >= 0.05, стабильный по
+    # эпохам. Значимость — дополнительное условие, а не замена порогу эффекта.
+    strong = [r for r in main_rows if r["verdict"] == "ПРОШЁЛ"]
+    detectable = [r for r in main_rows if r["sig_ok"]]
+    # Стабильность по эпохам: знак среднего IC сохраняется до/после 2025-03.
+    epoch_stable = {}
+    for label, sub, _ in windows:
+        before = sub[sub.index < pd.Timestamp("2025-03-01")]
+        after = sub[sub.index >= pd.Timestamp("2025-03-01")]
+        for p in PREDICTORS:
+            ic0 = before[p].dropna()
+            ic1 = after[p].dropna()
+            if len(ic0) >= 10 and len(ic1) >= 10:
+                epoch_stable[(label, p)] = (np.sign(ic0.mean()) == np.sign(ic1.mean())
+                                            and abs(ic0.mean()) >= IC_ACCEPT
+                                            and abs(ic1.mean()) >= IC_ACCEPT)
     if strong:
-        print("  Пережили порог IC >= 0.05 при 80% мощности:")
+        print(f"  Пережили порог |IC| >= {IC_ACCEPT} и значимость:")
         for r in strong:
             print(f"    {r['pred']:<17} ({r['label']})  IC {r['ic']:+.4f}, "
-                  f"t_eff {r['t_eff']:+.2f}, MDE .80 {r['mde_p80']:.4f}")
+                  f"t {r['t_eff']:+.2f}, MDE .80 {r['mde_p80']:.4f}")
         print("  Дальше — сравнение моделей на том же дизайне (шаг 2).")
     else:
-        mde_all = max(r["mde_p80"] for r in main_rows)
-        print("  Ни один предиктор не достиг порога по предрегистрации.")
-        print(f"  Лучшая доступная мощность: MDE .80 = {mde_all:.4f}.")
+        mde_all = min(r["mde_p80"] for r in main_rows)
+        max_ic = max(r["ic"] for r in main_rows)
+        print(f"  Ни один предиктор не достиг предрегистрированного порога "
+              f"|IC| >= {IC_ACCEPT}.")
+        print(f"  Лучшая доступная мощность: MDE .80 = {mde_all:.4f} "
+              f"(порог по IC, обнаружимый при power 0.80).")
+        print(f"  Максимальный |IC| = {max_ic:.4f} — до порога не дотягивает.")
+        if detectable:
+            names = ", ".join(r["pred"] for r in detectable)
+            print(f"  При этом статистически обнаружимы (|t| ≥ 2.50): {names}.")
+            print("  То есть эффект реален, но его ВЕЛИЧИНА ниже предрегистриро-")
+            print("  ванного порога 0.05 — критерий приёмки не выполнен именно")
+            print("  по величине эффекта, а не из-за отсутствия сигнала.")
         print("  Критерий приёмки не выполнен — проект закрывается честно")
         print("  (ROADMAP: «если нет — проект закрывается честно, нормальный")
         print("   результат»).")
